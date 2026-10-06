@@ -1,4 +1,4 @@
-// dmee-rules-version: 4
+// dmee-rules-version: 7
 // Injected into instagram.com. Hides every way into the Feed, Reels tab and Explore.
 // Instagram's class names change often, so we target link destinations instead.
 (function () {
@@ -221,6 +221,31 @@
       location.pathname === '/' || /^\/notifications\/?$/.test(location.pathname);
     var blocked = !onTabRoot || reelViewerOpen() || inHorizontalScroller(e.target);
     try { window.DmeeAndroid.touchStart(blocked); } catch (err) {}
+  }, { capture: true, passive: true });
+
+  // ---- Pull down to refresh (Chats) ----
+  // The inbox list scrolls inside its own box, so the app can't see whether it's at the top.
+  // Tell it whenever that changes: pull-to-refresh only starts when the list is at the very top.
+  function scrollerOf(el) {
+    for (; el && el.nodeType === 1 && el !== document.body; el = el.parentElement) {
+      var oy = window.getComputedStyle(el).overflowY;
+      if ((oy === 'auto' || oy === 'scroll') && el.scrollHeight > el.clientHeight + 2) return el;
+    }
+    return null;
+  }
+  var lastAtTop = null;
+  function reportAtTop(el) {
+    if (!window.DmeeAndroid || !window.DmeeAndroid.setAtTop) return;
+    var sc = scrollerOf(el);
+    var atTop = (window.scrollY || 0) <= 0 && (!sc || sc.scrollTop <= 0);
+    if (atTop === lastAtTop) return;
+    lastAtTop = atTop;
+    try { window.DmeeAndroid.setAtTop(atTop); } catch (err) {}
+  }
+  document.addEventListener('touchstart', function (e) { lastAtTop = null; reportAtTop(e.target); },
+    { capture: true, passive: true });
+  document.addEventListener('scroll', function (e) {
+    reportAtTop(e.target === document ? document.body : e.target);
   }, { capture: true, passive: true });
 
   function inHorizontalScroller(el) {
@@ -585,6 +610,81 @@
     tray.style.setProperty('padding-top', '12px', 'important');
   }
 
+  // Instagram's blue "unread" dots (inbox rows, notifications) become Dmee red.
+  // Only small, round, blue things are touched, so buttons and links keep their colour.
+  var DMEE_RED = '#FF1F2D';
+  function isBlue(c) {
+    var m = /rgba?\((\d+),\s*(\d+),\s*(\d+)/.exec(c || '');
+    if (!m) return false;
+    var r = +m[1], g = +m[2], b = +m[3];
+    return b > 200 && r < 130 && b - r > 90 && b - g > 40;
+  }
+  function redDots() {
+    if (!/^\/(direct\/inbox|notifications|accounts\/activity)/.test(location.pathname)) return;
+    var els = document.querySelectorAll('div, span, svg circle');
+    for (var j = 0; j < els.length; j++) {
+      var el = els[j];
+      if (el.tagName.toLowerCase() === 'circle') {
+        var f = getComputedStyle(el).fill;
+        if (isBlue(f)) el.style.setProperty('fill', DMEE_RED, 'important');
+        continue;
+      }
+      var w = el.offsetWidth, h = el.offsetHeight;
+      if (!w || w > 18 || Math.abs(w - h) > 2) continue;
+      var cs = getComputedStyle(el);
+      if (isBlue(cs.backgroundColor)) el.style.setProperty('background-color', DMEE_RED, 'important');
+      if (isBlue(cs.borderTopColor) && parseFloat(cs.borderTopWidth) >= 3)
+        el.style.setProperty('border-color', DMEE_RED, 'important');
+    }
+  }
+
+  // Dmee's tab bar floats over the page (Android): leave room under the last item.
+  // Not inside a chat: there the app moves the page above the bar (message box stays visible).
+  var TAB_BAR_SPACE = '84px';
+  var paddedEl = null, paddedPath = '', lastPadScan = 0;
+  function bigScroller() {
+    var vh = window.innerHeight, best = null, bestH = 0;
+    var divs = document.querySelectorAll('div, main, section');
+    for (var i = 0; i < divs.length; i++) {
+      var d = divs[i], h = d.clientHeight;
+      if (h < vh * 0.5 || h <= bestH || d.scrollHeight <= h + 2) continue;
+      var oy = getComputedStyle(d).overflowY;
+      if (oy === 'auto' || oy === 'scroll') { best = d; bestH = h; }
+    }
+    return best;
+  }
+  function padForTabBar() {
+    if (!window.DmeeAndroid) return;
+    var inThread = /^\/direct\/t\//.test(location.pathname);
+    var style = document.getElementById('dmee-pad');
+    if (!style) {
+      var parent = document.head || document.documentElement;
+      if (!parent) return;
+      style = document.createElement('style');
+      style.id = 'dmee-pad';
+      style.textContent = 'body { padding-bottom: ' + TAB_BAR_SPACE + ' !important; }';
+      parent.appendChild(style);
+    }
+    if (inThread) {
+      style.disabled = true;
+      if (paddedEl) { paddedEl.style.removeProperty('padding-bottom'); paddedEl = null; paddedPath = ''; }
+      return;
+    }
+    if (paddedEl && paddedPath === location.pathname && document.contains(paddedEl)) return;
+    // Nothing found yet on this page: look again at most once a second (the search isn't free).
+    if (!paddedEl && paddedPath === location.pathname && Date.now() - lastPadScan < 1000) return;
+    lastPadScan = Date.now();
+    if (paddedEl) paddedEl.style.removeProperty('padding-bottom');
+    paddedEl = bigScroller();
+    paddedPath = location.pathname;
+    if (paddedEl) {
+      paddedEl.style.setProperty('padding-bottom', TAB_BAR_SPACE, 'important');
+      style.disabled = true;  // the list scrolls in its own box: pad that, not the page
+    } else {
+      style.disabled = false; // the whole page scrolls: pad the page
+    }
+  }
+
   function run() {
     addStyle();
     hideInstagramNavBar();
@@ -597,6 +697,8 @@
     hideStoryPlaceholder();
     isolateStories();
     hideDiscoverOnActivity();
+    redDots();
+    padForTabBar();
   }
 
   // Instagram changes the page constantly (videos, lazy images). Running on every change made
