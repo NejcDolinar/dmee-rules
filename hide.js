@@ -1,4 +1,4 @@
-// dmee-rules-version: 7
+// dmee-rules-version: 15
 // Injected into instagram.com. Hides every way into the Feed, Reels tab and Explore.
 // Instagram's class names change often, so we target link destinations instead.
 (function () {
@@ -201,8 +201,17 @@
     }
   }, { capture: true, passive: true });
 
+  // Comments (and other panels on top of a reel) must still scroll and swipe down to close.
+  function insidePanel(el) {
+    if (!el || !el.closest) return false;
+    if (el.closest('[role="dialog"]')) return true;
+    var sc = scrollerOf(el);
+    return !!sc && (window.getComputedStyle(sc).scrollSnapType || '').indexOf('y') === -1;
+  }
+
   document.addEventListener('touchmove', function (e) {
     if (!e.touches.length || !reelViewerOpen()) return;
+    if (insidePanel(e.target)) return;
     var dx = e.touches[0].clientX - touchStartX;
     var dy = e.touches[0].clientY - touchStartY;
     if (Math.abs(dy) > Math.abs(dx)) {
@@ -685,6 +694,363 @@
     }
   }
 
+  // ===== Reels: sound on, double-tap to like, hold for 2x speed =====
+  var LIKE_LABELS = ['Like', 'Všeč mi je', 'Všečkaj', 'Gefällt mir', 'Mi piace', 'Me gusta', "J'aime", 'Sviđa mi se', 'Lubię to!'];
+  var MUTED_RE = /audio is muted|audio is off|zvok je (izklopljen|utišan)|ton ist aus|audio disattivato|el audio está desactivado/i;
+
+  function mainReelVideo() {
+    var vids = document.querySelectorAll('video');
+    for (var i = 0; i < vids.length; i++) {
+      var r = vids[i].getBoundingClientRect();
+      if (isVisible(vids[i]) && r.height > window.innerHeight * 0.5 && r.width > window.innerWidth * 0.6 &&
+          r.top < window.innerHeight / 2 && r.bottom > window.innerHeight / 2) return vids[i];
+    }
+    return null;
+  }
+
+  // Sound on by default (once per reel, so muting it again still works).
+  function unmuteReel() {
+    if (window.__dmeeHidden || !reelViewerOpen()) return;
+    var v = mainReelVideo();
+    if (!v || v.__dmeeUnmuted) return;
+    v.__dmeeUnmuted = true;
+    if (!v.muted) return;
+    var icons = document.querySelectorAll('svg[aria-label]');
+    for (var i = 0; i < icons.length; i++) {
+      if (MUTED_RE.test(icons[i].getAttribute('aria-label')) && isOnTop(icons[i])) {
+        (icons[i].closest('button, [role="button"]') || icons[i])
+          .dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
+        setTimeout(function () { if (v.muted) v.muted = false; }, 300);
+        return;
+      }
+    }
+    v.muted = false;
+  }
+
+  var UNLIKE_LABELS = ['Unlike', 'Ni mi več všeč', 'Odstrani všečkanje', 'Gefällt mir nicht mehr', 'Non mi piace più', 'Ya no me gusta', "Je n'aime plus", 'Ne sviđa mi se'];
+  function findLikeButton(orUnlike) {
+    var labels = orUnlike ? LIKE_LABELS.concat(UNLIKE_LABELS) : LIKE_LABELS;
+    var sel = labels.map(function (l) { return 'svg[aria-label="' + l + '"]'; }).join(', ');
+    var icons = document.querySelectorAll(sel);
+    for (var i = 0; i < icons.length; i++) {
+      var r = icons[i].getBoundingClientRect();
+      // the reel's own heart sits on the right side, not a comment's small heart
+      if (r.width >= 20 && r.left > window.innerWidth * 0.6 && isOnTop(icons[i])) {
+        return icons[i].closest('button, [role="button"]') || icons[i];
+      }
+    }
+    return null;
+  }
+
+  function showHeart(x, y) {
+    var h = document.createElement('div');
+    h.textContent = '❤';
+    h.style.cssText = 'position:fixed;left:' + (x - 50) + 'px;top:' + (y - 50) + 'px;width:100px;height:100px;' +
+      'font-size:90px;line-height:100px;text-align:center;color:#FF1F2D;z-index:2147483647;pointer-events:none;' +
+      'transform:scale(0.3);opacity:0;transition:transform 220ms cubic-bezier(.2,1.6,.4,1),opacity 220ms;' +
+      'text-shadow:0 4px 18px rgba(0,0,0,.35)';
+    document.body.appendChild(h);
+    requestAnimationFrame(function () { h.style.transform = 'scale(1)'; h.style.opacity = '1'; });
+    setTimeout(function () { h.style.transition = 'transform 260ms ease-in,opacity 260ms'; h.style.transform = 'scale(1.3) translateY(-30px)'; h.style.opacity = '0'; }, 520);
+    setTimeout(function () { h.remove(); }, 900);
+  }
+
+  function onControl(el) {
+    if (!el || !el.closest) return false;
+    if (el.closest('[role="dialog"], input, textarea, #dmee-2x')) return true;
+    var c = el.closest('a, button, [role="button"]');
+    if (!c) return false;
+    var r = c.getBoundingClientRect();
+    // the whole reel is one big clickable box: that's the video, not a button
+    return r.width * r.height < window.innerWidth * window.innerHeight * 0.25;
+  }
+
+  var tap = null, lastTap = null, hold = null, swallowClickUntil = 0;
+  document.addEventListener('touchstart', function (e) {
+    tap = null;
+    if (e.touches.length !== 1 || !reelViewerOpen() || onControl(e.target)) return;
+    var t = e.touches[0];
+    tap = { x: t.clientX, y: t.clientY, t: Date.now(), moved: false };
+    var v = mainReelVideo();
+    if (!v) return;
+    hold = { v: v, on: false, timer: setTimeout(function () {
+      if (!tap || tap.moved) return;
+      hold.on = true;
+      hold.prev = v.playbackRate;
+      v.playbackRate = 2;
+      if (v.paused) v.play().catch(function () {});
+      showSpeedPill(true);
+      // Instagram may pause on a long press: keep it playing fast while the finger stays down
+      hold.keep = setInterval(function () {
+        if (v.playbackRate !== 2) v.playbackRate = 2;
+        if (v.paused) v.play().catch(function () {});
+      }, 100);
+    }, 350) };
+  }, { capture: true, passive: true });
+
+  document.addEventListener('touchmove', function (e) {
+    if (!tap || !e.touches.length) return;
+    var t = e.touches[0];
+    if (Math.abs(t.clientX - tap.x) > 10 || Math.abs(t.clientY - tap.y) > 10) tap.moved = true;
+  }, { capture: true, passive: true });
+
+  function endHold() {
+    if (!hold) return false;
+    clearTimeout(hold.timer);
+    clearInterval(hold.keep);
+    var was = hold.on;
+    if (was) { hold.v.playbackRate = hold.prev || 1; showSpeedPill(false); update2xButton(); }
+    hold = null;
+    return was;
+  }
+
+  // Like the Instagram app: a single tap only pauses after a short wait, so a double tap never
+  // pauses the reel. Instagram's own click is held back and replayed only for a real single tap.
+  var pendingClick = null, pendingTimer = null;
+  document.addEventListener('touchend', function (e) {
+    var wasHold = endHold();
+    if (wasHold) { swallowClickUntil = Date.now() + 500; e.preventDefault(); e.stopPropagation(); tap = null; return; }
+    if (!tap || tap.moved || Date.now() - tap.t > 250) { tap = null; return; }
+    var now = Date.now();
+    if (lastTap && now - lastTap.t < 320 && Math.abs(tap.x - lastTap.x) < 40 && Math.abs(tap.y - lastTap.y) < 40) {
+      var x = tap.x, y = tap.y;
+      lastTap = null;
+      clearTimeout(pendingTimer); pendingClick = null; // no pause
+      swallowClickUntil = Date.now() + 400; // the second tap's click must not pause either
+      showHeart(x, y);
+      setTimeout(function () {
+        var b = findLikeButton();
+        if (!b) return;
+        var lc = new MouseEvent('click', { bubbles: true, cancelable: true, view: window });
+        lc.__dmeeReplay = true; // our own click: never swallowed
+        b.dispatchEvent(lc);
+      }, 60);
+    } else {
+      lastTap = { x: tap.x, y: tap.y, t: now };
+      clearTimeout(pendingTimer);
+      pendingTimer = setTimeout(function () {
+        var c = pendingClick; pendingClick = null;
+        if (!c) return;
+        var ev = new MouseEvent('click', { bubbles: true, cancelable: true, view: window, clientX: c.x, clientY: c.y });
+        ev.__dmeeReplay = true;
+        c.el.dispatchEvent(ev);
+      }, 300);
+    }
+    tap = null;
+  }, { capture: true, passive: false });
+  // Hold back Instagram's click on the reel itself (not on its buttons) until we know it's a single tap.
+  document.addEventListener('click', function (e) {
+    if (e.__dmeeReplay || !lastTap || Date.now() - lastTap.t > 300) return;
+    if (!reelViewerOpen() || onControl(e.target)) return;
+    e.preventDefault(); e.stopPropagation();
+    pendingClick = { el: e.target, x: e.clientX, y: e.clientY };
+  }, true);
+  document.addEventListener('touchcancel', function () { endHold(); tap = null; }, { capture: true, passive: true });
+
+  ['click', 'pointerup', 'mouseup'].forEach(function (type) {
+    document.addEventListener(type, function (e) {
+      if (!e.__dmeeReplay && Date.now() < swallowClickUntil) { e.preventDefault(); e.stopPropagation(); }
+    }, true);
+  });
+  document.addEventListener('contextmenu', function (e) { if (reelViewerOpen()) e.preventDefault(); }, true);
+
+  function showSpeedPill(on) {
+    var p = document.getElementById('dmee-speed');
+    if (!p) {
+      p = document.createElement('div');
+      p.id = 'dmee-speed';
+      p.textContent = '2×  ▶▶';
+      p.style.cssText = 'position:fixed;left:50%;top:70px;transform:translateX(-50%) scale(.9);padding:6px 14px;' +
+        'border-radius:999px;background:rgba(0,0,0,.55);color:#fff;font:600 14px -apple-system,Roboto,sans-serif;' +
+        'z-index:2147483647;pointer-events:none;opacity:0;transition:opacity 150ms,transform 150ms';
+      document.body.appendChild(p);
+    }
+    p.style.opacity = on ? '1' : '0';
+    p.style.transform = 'translateX(-50%) scale(' + (on ? 1 : 0.9) + ')';
+  }
+
+  // ===== 2x button, just above the reel's like button =====
+  function update2xButton() {
+    var b = document.getElementById('dmee-2x');
+    var v = (!window.__dmeeHidden && reelViewerOpen()) ? mainReelVideo() : null;
+    var like = v ? findLikeButton(true) : null;
+    if (!v || !like) { if (b) b.style.display = 'none'; return; }
+    if (!b) {
+      b = document.createElement('div');
+      b.id = 'dmee-2x';
+      b.setAttribute('role', 'button');
+      b.style.cssText = 'position:fixed;width:44px;height:44px;border-radius:22px;display:flex;align-items:center;' +
+        'justify-content:center;font:700 15px -apple-system,Roboto,sans-serif;z-index:2147483646;' +
+        'transition:background 150ms,color 150ms,transform 120ms;-webkit-tap-highlight-color:transparent';
+      b.addEventListener('click', function (e) {
+        e.preventDefault(); e.stopPropagation();
+        var cur = mainReelVideo();
+        if (!cur) return;
+        cur.playbackRate = cur.playbackRate > 1 ? 1 : 2;
+        if (cur.paused) cur.play().catch(function () {});
+        paint2x(b, cur);
+      }, true);
+      ['touchstart', 'touchend', 'pointerdown', 'pointerup'].forEach(function (t) {
+        b.addEventListener(t, function (e) { e.stopPropagation(); }, true);
+      });
+      document.body.appendChild(b);
+    }
+    var r = like.getBoundingClientRect();
+    b.style.left = Math.round(r.left + r.width / 2 - 22) + 'px';
+    b.style.top = Math.round(r.top - 58) + 'px';
+    b.style.display = 'flex';
+    paint2x(b, v);
+  }
+  function paint2x(b, v) {
+    var on = v.playbackRate > 1;
+    b.textContent = on ? '2\u00d7' : '1\u00d7';
+    b.style.background = on ? '#FF1F2D' : 'rgba(0,0,0,.35)';
+    b.style.color = '#fff';
+    b.style.border = on ? 'none' : '1.5px solid rgba(255,255,255,.85)';
+  }
+
+  // ===== Reel open: tell the app (it hides the menu) =====
+  var lastReel = null;
+  // While a reel is open, no text can be selected (a long press is "hold for 2x", not "copy text").
+  var NOSELECT_CSS =
+    'html.dmee-reel, html.dmee-reel * { -webkit-user-select: none !important; user-select: none !important;' +
+    ' -webkit-touch-callout: none !important; }' +
+    'html.dmee-reel input, html.dmee-reel textarea, html.dmee-reel [contenteditable="true"] {' +
+    ' -webkit-user-select: text !important; user-select: text !important; }';
+  function setNoSelect(on) {
+    var root = document.documentElement;
+    if (!root) return;
+    if (!document.getElementById('dmee-noselect')) {
+      var parent = document.head || root;
+      var st = document.createElement('style');
+      st.id = 'dmee-noselect';
+      st.textContent = NOSELECT_CSS;
+      parent.appendChild(st);
+    }
+    if (on) {
+      root.classList.add('dmee-reel');
+    } else if (root.classList.contains('dmee-reel')) {
+      root.classList.remove('dmee-reel');
+    }
+  }
+
+  function reportReel() {
+    var reelOpen = reelViewerOpen();
+    setNoSelect(reelOpen);
+    if (reelOpen && window.getSelection) { var sel = window.getSelection(); if (sel && sel.type === 'Range') sel.removeAllRanges(); }
+    if (!window.DmeeAndroid || !window.DmeeAndroid.setReelOpen) return;
+    var open = !window.__dmeeHidden && reelOpen;
+    if (open === lastReel) return;
+    lastReel = open;
+    try { window.DmeeAndroid.setReelOpen(open); } catch (err) {}
+  }
+
+  // ===== Reel author name squeezed into one letter per line (long "AI-generated" labels) =====
+  function fixSqueezedNames() {
+    if (!reelViewerOpen()) return;
+    var links = document.querySelectorAll('a[href^="/"]');
+    for (var i = 0; i < links.length; i++) {
+      var a = links[i];
+      if (a.__dmeeFixed || !(a.textContent || '').trim()) continue;
+      var r = a.getBoundingClientRect();
+      if (r.width > 0 && r.width < 40 && r.height > 70) {
+        a.__dmeeFixed = true;
+        var els = [a].concat(Array.prototype.slice.call(a.querySelectorAll('*')));
+        for (var j = 0; j < els.length; j++) {
+          els[j].style.setProperty('white-space', 'nowrap', 'important');
+          els[j].style.setProperty('word-break', 'normal', 'important');
+          els[j].style.setProperty('overflow-wrap', 'normal', 'important');
+        }
+        // keep the name, shorten the label next to it instead
+        for (var el = a; el && el !== document.body && el.getBoundingClientRect().width < 60; el = el.parentElement) {
+          el.style.setProperty('flex-shrink', '0', 'important');
+          el.style.setProperty('min-width', 'auto', 'important');
+        }
+      }
+    }
+  }
+
+  // ===== Chats search open: tell the app (it hides the lock button) =====
+  var lastSearching = null;
+  function reportSearching() {
+    if (!window.DmeeAndroid || !window.DmeeAndroid.setSearching) return;
+    var onInbox = /^\/direct\/inbox\/?$/.test(location.pathname);
+    var searching = false;
+    if (onInbox) {
+      var a = document.activeElement;
+      if (a && a.tagName === 'INPUT') searching = true;
+      var ins = document.querySelectorAll('input');
+      for (var i = 0; i < ins.length && !searching; i++) {
+        if (ins[i].value && isVisible(ins[i])) searching = true;
+      }
+    }
+    if (searching === lastSearching) return;
+    lastSearching = searching;
+    try { window.DmeeAndroid.setSearching(searching); } catch (err) {}
+  }
+  ['focusin', 'focusout', 'input'].forEach(function (t) {
+    document.addEventListener(t, function () { setTimeout(reportSearching, 0); }, true);
+  });
+
+  // ===== Tab hidden: stop every video / sound on this page =====
+  window.__dmeeSetHidden = function (hidden) {
+    window.__dmeeHidden = !!hidden;
+    if (hidden) pauseAllMedia();
+  };
+  function pauseAllMedia() {
+    var m = document.querySelectorAll('video, audio');
+    for (var i = 0; i < m.length; i++) { try { if (!m[i].paused) m[i].pause(); } catch (err) {} }
+  }
+
+  // ===== Instant tap feedback on Instagram's buttons (feels native) =====
+  // Only the small button under the finger dims (CSS :active also dimmed whole button columns).
+  var FEEDBACK_CSS =
+    'button, [role="button"], a { -webkit-tap-highlight-color: transparent; }' +
+    '.dmee-pressed { opacity: .55 !important; transition: opacity 80ms ease !important; }' +
+    '.dmee-released { transition: opacity 160ms ease !important; }' +
+    '@keyframes dmeePop { 0% { transform: scale(.82); } 55% { transform: scale(1.18); } 100% { transform: scale(1); } }' +
+    '.dmee-pop { animation: dmeePop 280ms cubic-bezier(.2,.9,.3,1.3) !important; transform-origin: center !important; }';
+  function addFeedbackStyle() {
+    if (document.getElementById('dmee-feedback')) return;
+    var parent = document.head || document.documentElement;
+    if (!parent) return;
+    var s = document.createElement('style');
+    s.id = 'dmee-feedback';
+    s.textContent = FEEDBACK_CSS;
+    parent.appendChild(s);
+  }
+  var pressedEl = null;
+  document.addEventListener('touchstart', function (e) {
+    if (e.touches.length !== 1 || !e.target.closest) return;
+    var c = e.target.closest('button, [role="button"]');
+    if (!c || c.id === 'dmee-2x') return;
+    var r = c.getBoundingClientRect();
+    if (r.width > 120 || r.height > 120) return; // rows and big areas: no dimming
+    pressedEl = c;
+    c.classList.remove('dmee-released');
+    c.classList.add('dmee-pressed');
+  }, { capture: true, passive: true });
+  function releasePress(e) {
+    if (!pressedEl) return;
+    var c = pressedEl; pressedEl = null;
+    // a quick "pop" on the icon: the tap registered, even if Instagram takes a moment to answer
+    if (e && e.type === 'touchend') {
+      var icon = c.querySelector('svg') || c;
+      icon.classList.remove('dmee-pop');
+      void icon.getBoundingClientRect();
+      icon.classList.add('dmee-pop');
+      setTimeout(function () { icon.classList.remove('dmee-pop'); }, 320);
+    }
+    c.classList.remove('dmee-pressed');
+    c.classList.add('dmee-released');
+    setTimeout(function () { c.classList.remove('dmee-released'); }, 200);
+  }
+  document.addEventListener('touchend', releasePress, { capture: true, passive: true });
+  document.addEventListener('touchcancel', releasePress, { capture: true, passive: true });
+  document.addEventListener('touchmove', function (e) {
+    if (pressedEl && tap && tap.moved) releasePress();
+  }, { capture: true, passive: true });
+
   function run() {
     addStyle();
     hideInstagramNavBar();
@@ -699,6 +1065,13 @@
     hideDiscoverOnActivity();
     redDots();
     padForTabBar();
+    addFeedbackStyle();
+    unmuteReel();
+    update2xButton();
+    reportSearching();
+    reportReel();
+    fixSqueezedNames();
+    if (window.__dmeeHidden) pauseAllMedia();
   }
 
   // Instagram changes the page constantly (videos, lazy images). Running on every change made
@@ -733,6 +1106,11 @@
   document.addEventListener('DOMContentLoaded', run);
   // Suggested reels can load without a big DOM change, so also check regularly.
   setInterval(function () {
+    if (window.__dmeeHidden) pauseAllMedia();
+    unmuteReel();
+    update2xButton();
+    reportReel();
+    fixSqueezedNames();
     hideStoryPlaceholder();
     if (!document.querySelector('video')) return;
     removeSuggestedReels();
