@@ -1,4 +1,4 @@
-// dmee-rules-version: 15
+// dmee-rules-version: 18
 // Injected into instagram.com. Hides every way into the Feed, Reels tab and Explore.
 // Instagram's class names change often, so we target link destinations instead.
 (function () {
@@ -589,7 +589,26 @@
     return null;
   }
 
+  // Feed posts are <article>s: hide them instantly with CSS (no flash while a story opens/closes).
+  var STORIES_CSS =
+    'html[data-dmee-home] main article, html[data-dmee-stories] [data-dmee-iso] { display: none !important; }';
+  function addStoriesStyle() {
+    if (document.getElementById('dmee-stories-css')) return;
+    var parent = document.head || document.documentElement;
+    if (!parent) return;
+    var st = document.createElement('style');
+    st.id = 'dmee-stories-css';
+    st.textContent = STORIES_CSS;
+    parent.appendChild(st);
+  }
+
   function isolateStories() {
+    addStoriesStyle();
+    // Home page = the Stories tab: feed posts never show (only stories). Story viewer pages are untouched.
+    if (location.pathname === '/') document.documentElement.setAttribute('data-dmee-home', '1');
+    else document.documentElement.removeAttribute('data-dmee-home');
+    // Opening a story (and coming back) keeps the feed hidden: no posts flash underneath.
+    if (onStories() && document.documentElement.hasAttribute('data-dmee-stories')) return;
     var hidden = document.querySelectorAll('[data-dmee-iso]');
     if (location.pathname !== '/') {
       for (var i = 0; i < hidden.length; i++) {
@@ -616,7 +635,7 @@
         c.setAttribute('data-dmee-iso', '1');
       }
     }
-    tray.style.setProperty('padding-top', '12px', 'important');
+    tray.style.setProperty('padding-top', '28px', 'important');
   }
 
   // Instagram's blue "unread" dots (inbox rows, notifications) become Dmee red.
@@ -913,9 +932,9 @@
   var lastReel = null;
   // While a reel is open, no text can be selected (a long press is "hold for 2x", not "copy text").
   var NOSELECT_CSS =
-    'html.dmee-reel, html.dmee-reel * { -webkit-user-select: none !important; user-select: none !important;' +
+    'html[data-dmee-reel], html[data-dmee-reel] * { -webkit-user-select: none !important; user-select: none !important;' +
     ' -webkit-touch-callout: none !important; }' +
-    'html.dmee-reel input, html.dmee-reel textarea, html.dmee-reel [contenteditable="true"] {' +
+    'html[data-dmee-reel] input, html[data-dmee-reel] textarea, html[data-dmee-reel] [contenteditable="true"] {' +
     ' -webkit-user-select: text !important; user-select: text !important; }';
   function setNoSelect(on) {
     var root = document.documentElement;
@@ -928,9 +947,9 @@
       parent.appendChild(st);
     }
     if (on) {
-      root.classList.add('dmee-reel');
-    } else if (root.classList.contains('dmee-reel')) {
-      root.classList.remove('dmee-reel');
+      if (!root.hasAttribute('data-dmee-reel')) root.setAttribute('data-dmee-reel', '1');
+    } else if (root.hasAttribute('data-dmee-reel')) {
+      root.removeAttribute('data-dmee-reel');
     }
   }
 
@@ -1051,6 +1070,170 @@
     if (pressedEl && tap && tap.moved) releasePress();
   }, { capture: true, passive: true });
 
+  // ===== Back button while a reel is open: close the reel (stay in the chat) =====
+  // Press the reel's own top-left arrow (the same one that already works when tapped).
+  function topLeftBackButton() {
+    var cands = document.querySelectorAll('a, button, [role="button"]');
+    var best = null, bestScore = 1e9;
+    for (var i = 0; i < cands.length; i++) {
+      var c = cands[i];
+      if (!c.querySelector('svg')) continue;
+      var r = c.getBoundingClientRect();
+      if (!r.width || r.top > 140 || r.left > window.innerWidth * 0.25 || r.width > 80) continue;
+      if (!isOnTop(c)) continue;
+      var score = r.top + r.left;
+      if (score < bestScore) { best = c; bestScore = score; }
+    }
+    return best;
+  }
+  window.__dmeeCloseReel = function () {
+    if (!reelViewerOpen()) return false;
+    var btn = topLeftBackButton();
+    if (btn) {
+      var ev = new MouseEvent('click', { bubbles: true, cancelable: true, view: window });
+      ev.__dmeeReplay = true;
+      btn.dispatchEvent(ev);
+      return true;
+    }
+    closeReelViewer(reelViewerRoot());
+    return true;
+  };
+
+  // ===== Instagram notices with an X hiding under Dmee's round buttons (Profile) =====
+  // A full-width bar near the top that holds a close (X) button: hide the bar.
+  function hideTopNotices() {
+    var path = location.pathname;
+    if (/^\/(direct|stories)\//.test(path) || reelViewerOpen()) return;
+    var xs = document.querySelectorAll('svg[aria-label="Close"], svg[aria-label="Zapri"], svg[aria-label="Dismiss"], svg[aria-label="Opusti"]');
+    for (var i = 0; i < xs.length; i++) {
+      var x = xs[i];
+      if (x.closest('[role="dialog"], [data-dmee-notice]')) continue;
+      var r = x.getBoundingClientRect();
+      if (!r.width || r.top > 160 || r.top < -10) continue;
+      for (var el = x.parentElement, d = 0; el && el !== document.body && d < 8; el = el.parentElement, d++) {
+        var b = el.getBoundingClientRect();
+        if (b.width >= window.innerWidth * 0.85 && b.height > 30 && b.height < 200 && b.top < 160) {
+          if (!safeToHide(el)) break;
+          el.style.setProperty('display', 'none', 'important');
+          el.setAttribute('data-dmee-notice', '1');
+          break;
+        }
+      }
+    }
+  }
+
+  // ===== Chat: press and hold a message for react / reply / copy / unsend =====
+  // Instagram's website shows those buttons on mouse hover; on a phone a long press now reveals them.
+  var THREAD_CSS =
+    'html[data-dmee-thread], html[data-dmee-thread] * { -webkit-user-select: none !important;' +
+    ' user-select: none !important; -webkit-touch-callout: none !important; }' +
+    'html[data-dmee-thread] input, html[data-dmee-thread] textarea, html[data-dmee-thread] [contenteditable="true"],' +
+    ' html[data-dmee-thread] [contenteditable="true"] *, html[data-dmee-thread] [role="textbox"] {' +
+    ' -webkit-user-select: text !important; user-select: text !important; }';
+  var MORE_RE = /^(more|more options|see more options|options|več|več možnosti|možnosti|mehr|altro|más|plus)$/i;
+  // The hover buttons sit next to the message: react, reply, "..." — the "..." is the one farthest out.
+  function moreButtonNear(x, y) {
+    var cands = document.querySelectorAll('button, [role="button"]');
+    var best = null, bestDist = -1;
+    for (var i = 0; i < cands.length; i++) {
+      var c = cands[i];
+      if (!c.querySelector('svg') || c.closest('header, form, [role="dialog"]')) continue;
+      var r = c.getBoundingClientRect();
+      if (!r.width || r.width > 56 || r.height > 56) continue;
+      if (Math.abs((r.top + r.bottom) / 2 - y) > 45) continue;
+      var dist = Math.abs((r.left + r.right) / 2 - x);
+      if (dist > bestDist) { best = c; bestDist = dist; }
+    }
+    return best;
+  }
+
+  function findMoreButton(start) {
+    for (var el = start, d = 0; el && el !== document.body && d < 12; el = el.parentElement, d++) {
+      var r = el.getBoundingClientRect();
+      if (r.height > window.innerHeight * 0.6) break; // gone past the message
+      var svgs = el.querySelectorAll('svg[aria-label]');
+      for (var i = 0; i < svgs.length; i++) {
+        if (MORE_RE.test((svgs[i].getAttribute('aria-label') || '').trim())) {
+          return svgs[i].closest('button, [role="button"], a') || svgs[i];
+        }
+      }
+    }
+    return null;
+  }
+  function onThread() { return /^\/direct\/t\//.test(location.pathname); }
+  function updateThreadMode() {
+    var root = document.documentElement;
+    if (!root) return;
+    if (!document.getElementById('dmee-thread-css')) {
+      var parent = document.head || root;
+      var st = document.createElement('style');
+      st.id = 'dmee-thread-css';
+      st.textContent = THREAD_CSS;
+      parent.appendChild(st);
+    }
+    if (onThread()) { if (!root.hasAttribute('data-dmee-thread')) root.setAttribute('data-dmee-thread', '1'); }
+    else if (root.hasAttribute('data-dmee-thread')) root.removeAttribute('data-dmee-thread');
+  }
+  function hoverChain(el) {
+    var opts = { bubbles: true, cancelable: true, view: window };
+    for (var up = el, d = 0; up && up !== document.body && d < 10; up = up.parentElement, d++) {
+      ['pointerover', 'pointerenter', 'mouseover', 'mouseenter', 'mousemove'].forEach(function (t) {
+        try {
+          up.dispatchEvent(t.indexOf('pointer') === 0 ? new PointerEvent(t, opts) : new MouseEvent(t, opts));
+        } catch (err) {}
+      });
+      if (up.getBoundingClientRect().height > window.innerHeight * 0.6) break;
+    }
+  }
+  var msgPress = null;
+  document.addEventListener('touchstart', function (e) {
+    msgPress = null;
+    if (!onThread() || e.touches.length !== 1 || reelViewerOpen()) return;
+    var t = e.target;
+    if (!t.closest || t.closest('input, textarea, [contenteditable="true"], [role="textbox"]')) return;
+    if (t.closest('header, a[href*="/direct/inbox"]')) return;
+    var p = e.touches[0];
+    msgPress = { x: p.clientX, y: p.clientY, el: t, timer: setTimeout(function () {
+      if (!msgPress) return;
+      var target = msgPress.el;
+      hoverChain(target);
+      msgPress.fired = true;
+      // Instagram's "..." appears on hover: open it right away (react, reply, copy, unsend...).
+      try { var sel0 = window.getSelection(); if (sel0) sel0.removeAllRanges(); } catch (err) {}
+      var touchX = msgPress.x, touchY = msgPress.y;
+      setTimeout(function () {
+        var more = findMoreButton(target) || moreButtonNear(touchX, touchY);
+        if (!more) return;
+        try { navigator.vibrate && navigator.vibrate(12); } catch (err) {}
+        var ev = new MouseEvent('click', { bubbles: true, cancelable: true, view: window });
+        ev.__dmeeReplay = true;
+        more.dispatchEvent(ev);
+      }, 90);
+    }, 420) };
+  }, { capture: true, passive: true });
+  document.addEventListener('touchmove', function (e) {
+    if (!msgPress || !e.touches.length) return;
+    var p = e.touches[0];
+    if (Math.abs(p.clientX - msgPress.x) > 10 || Math.abs(p.clientY - msgPress.y) > 10) {
+      clearTimeout(msgPress.timer); msgPress = null;
+    }
+  }, { capture: true, passive: true });
+  document.addEventListener('touchend', function (e) {
+    if (!msgPress) return;
+    clearTimeout(msgPress.timer);
+    if (msgPress.fired) { e.preventDefault(); swallowClickUntil = Date.now() + 400; }
+    msgPress = null;
+  }, { capture: true, passive: false });
+  document.addEventListener('contextmenu', function (e) { if (onThread()) e.preventDefault(); }, true);
+  document.addEventListener('selectionchange', function () {
+    if (!onThread()) return;
+    var sel = window.getSelection();
+    if (!sel || sel.type !== 'Range' || !sel.anchorNode) return;
+    var n = sel.anchorNode.nodeType === 1 ? sel.anchorNode : sel.anchorNode.parentElement;
+    if (n && n.closest && n.closest('input, textarea, [contenteditable="true"], [role="textbox"]')) return;
+    sel.removeAllRanges();
+  });
+
   function run() {
     addStyle();
     hideInstagramNavBar();
@@ -1100,7 +1283,14 @@
   // Instagram changes pages without reloading: re-check right away on every page change.
   ['pushState', 'replaceState'].forEach(function (fn) {
     var orig = history[fn];
-    history[fn] = function () { var r = orig.apply(this, arguments); setTimeout(run, 0); return r; };
+    history[fn] = function () {
+      var r = orig.apply(this, arguments);
+      // Feed hiding switches at the same moment as the page (no flash of posts).
+      if (location.pathname === '/') document.documentElement.setAttribute('data-dmee-home', '1');
+      else document.documentElement.removeAttribute('data-dmee-home');
+      setTimeout(run, 0);
+      return r;
+    };
   });
   window.addEventListener('popstate', function () { setTimeout(run, 0); });
   document.addEventListener('DOMContentLoaded', run);
