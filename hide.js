@@ -1,9 +1,18 @@
-// dmee-rules-version: 18
+// dmee-rules-version: 30
 // Injected into instagram.com. Hides every way into the Feed, Reels tab and Explore.
 // Instagram's class names change often, so we target link destinations instead.
 (function () {
   if (window.__dmeeInstalled) return;
   window.__dmeeInstalled = true;
+
+  // Reels in higher quality: Instagram's player picks the video quality from the connection it
+  // thinks you have; the in-app browser often reports a slow one. Report a fast connection.
+  try {
+    var fastNet = { effectiveType: '4g', downlink: 10, rtt: 50, saveData: false, type: 'wifi',
+      addEventListener: function () {}, removeEventListener: function () {}, onchange: null };
+    Object.defineProperty(navigator, 'connection', { get: function () { return fastNet; }, configurable: true });
+    Object.defineProperty(navigator, 'deviceMemory', { get: function () { return 8; }, configurable: true });
+  } catch (err) {}
 
   var STYLE =
     'a[href="/"], a[href="/explore/"], a[href^="/explore/"], a[href="/reels/"], ' +
@@ -94,7 +103,7 @@
 
   function snapContainersWithVideo() {
     var found = [];
-    var vids = document.querySelectorAll('video');
+    var vids = document.querySelectorAll('video:not(.dmee-vid)');
     for (var i = 0; i < vids.length; i++) {
       for (var el = vids[i].parentElement; el && el !== document.body; el = el.parentElement) {
         var snap = window.getComputedStyle(el).scrollSnapType || '';
@@ -161,7 +170,7 @@
   // (cutting off Like/Comment/Share). Stretch those boxes to the full width.
   function fillReelWidth() {
     if (onStories()) return;
-    var vids = document.querySelectorAll('video');
+    var vids = document.querySelectorAll('video:not(.dmee-vid)');
     for (var i = 0; i < vids.length; i++) {
       var v = vids[i];
       if (!isVisible(v) || v.getBoundingClientRect().height < window.innerHeight * 0.5) continue;
@@ -183,7 +192,7 @@
   // Extra safety: no vertical swipes inside a full-screen reel viewer.
   function reelViewerOpen() {
     if (onStories()) return false; // stories keep Instagram's own taps and swipes
-    var vids = document.querySelectorAll('video');
+    var vids = document.querySelectorAll('video:not(.dmee-vid)');
     for (var i = 0; i < vids.length; i++) {
       var r = vids[i].getBoundingClientRect();
       if (isVisible(vids[i]) && r.height > window.innerHeight * 0.5 && r.width > window.innerWidth * 0.6) {
@@ -228,7 +237,8 @@
     if (!window.DmeeAndroid || e.touches.length !== 1) return;
     var onTabRoot = /^\/direct\/inbox\/?$/.test(location.pathname) || PROFILE_ROOT.test(location.pathname) ||
       location.pathname === '/' || /^\/notifications\/?$/.test(location.pathname);
-    var blocked = !onTabRoot || reelViewerOpen() || inHorizontalScroller(e.target);
+    var blocked = !onTabRoot || reelViewerOpen() || inHorizontalScroller(e.target) ||
+      !!(e.target.closest && e.target.closest('.dmee-media'));
     try { window.DmeeAndroid.touchStart(blocked); } catch (err) {}
   }, { capture: true, passive: true });
 
@@ -301,7 +311,7 @@
 
   // ---- Reel: drag it to the left to close (it follows your finger, the chat shows underneath) ----
   function reelViewerRoot() {
-    var vids = document.querySelectorAll('video');
+    var vids = document.querySelectorAll('video:not(.dmee-vid)');
     for (var i = 0; i < vids.length; i++) {
       var r = vids[i].getBoundingClientRect();
       if (!isVisible(vids[i]) || r.height < window.innerHeight * 0.5) continue;
@@ -626,7 +636,7 @@
       var parent = el.parentElement;
       if (!parent) break;
       for (var c = parent.firstElementChild; c; c = c.nextElementSibling) {
-        if (c === el || c.hasAttribute('data-dmee-iso')) continue;
+        if (c === el || c.hasAttribute('data-dmee-iso') || (c.id && c.id.indexOf('dmee-') === 0)) continue;
         // Already hidden by another Dmee rule (e.g. Instagram's bottom bar): leave it hidden for good.
         if (c.hasAttribute('data-dmee-hidden') || c.hasAttribute('data-dmee-discover') ||
             c.hasAttribute('data-dmee-promo') || c.hasAttribute('data-dmee-sugg')) continue;
@@ -635,7 +645,8 @@
         c.setAttribute('data-dmee-iso', '1');
       }
     }
-    tray.style.setProperty('padding-top', '28px', 'important');
+    tray.style.setProperty('padding-top', '6px', 'important');
+    tray.style.setProperty('padding-bottom', '2px', 'important');
   }
 
   // Instagram's blue "unread" dots (inbox rows, notifications) become Dmee red.
@@ -718,7 +729,7 @@
   var MUTED_RE = /audio is muted|audio is off|zvok je (izklopljen|utišan)|ton ist aus|audio disattivato|el audio está desactivado/i;
 
   function mainReelVideo() {
-    var vids = document.querySelectorAll('video');
+    var vids = document.querySelectorAll('video:not(.dmee-vid)');
     for (var i = 0; i < vids.length; i++) {
       var r = vids[i].getBoundingClientRect();
       if (isVisible(vids[i]) && r.height > window.innerHeight * 0.5 && r.width > window.innerWidth * 0.6 &&
@@ -1014,7 +1025,7 @@
   // ===== Tab hidden: stop every video / sound on this page =====
   window.__dmeeSetHidden = function (hidden) {
     window.__dmeeHidden = !!hidden;
-    if (hidden) pauseAllMedia();
+    if (hidden) pauseAllMedia(); else setTimeout(run, 0);
   };
   function pauseAllMedia() {
     var m = document.querySelectorAll('video, audio');
@@ -1234,8 +1245,703 @@
     sel.removeAllRanges();
   });
 
+  // ===== Page is drawn: tell Dmee to remove its loading skeleton =====
+  // Instagram first shows its logo splash screen while its code starts; Dmee covers that with a
+  // shimmer skeleton and removes it as soon as real content (or the login form) is on screen.
+  var readySent = false, readyStart = Date.now();
+  function splashVisible() {
+    var s = document.getElementById('splash-screen');
+    if (s) { var r = s.getBoundingClientRect(); if (r.width && r.height && getComputedStyle(s).display !== 'none') return true; }
+    // Generic: a lone logo in the middle of an otherwise empty page.
+    var b = document.body;
+    return !b || (b.innerText || '').trim().length < 3;
+  }
+  function reportReady() {
+    if (readySent) return;
+    var content = document.querySelector('main, [role="main"], nav, input[name="username"], input[name="email"], form input[type="password"]');
+    var text = document.body ? (document.body.innerText || '').trim().length : 0;
+    if ((!content && text < 40) || splashVisible()) {
+      if (Date.now() - readyStart < 15000) setTimeout(reportReady, 120);
+      return;
+    }
+    readySent = true;
+    // One more frame so the first paint is done before the skeleton fades.
+    requestAnimationFrame(function () {
+      try { if (window.DmeeAndroid && window.DmeeAndroid.pageReady) window.DmeeAndroid.pageReady(); } catch (err) {}
+    });
+  }
+  setTimeout(reportReady, 50);
+
+  // ===== An Instagram close (X) under Dmee's round corner buttons (e.g. "daily limit" screen) =====
+  var CLOSE_RE = /^(close|dismiss|zapri|opusti|schließen|schliessen|cerrar|fermer|chiudi|zatvori|zamknij)$/i;
+  var lastCorner = '';
+  function reportCornerClose() {
+    if (!window.DmeeAndroid || !window.DmeeAndroid.setCornerBusy) return;
+    var left = false, right = false, w = window.innerWidth;
+    if (!/^\/(direct|stories)\//.test(location.pathname)) {
+      var xs = document.querySelectorAll('svg[aria-label], [role="button"][aria-label], button[aria-label]');
+      for (var i = 0; i < xs.length; i++) {
+        if (!CLOSE_RE.test((xs[i].getAttribute('aria-label') || '').trim())) continue;
+        var r = xs[i].getBoundingClientRect();
+        if (!r.width || r.top > 100 || r.bottom < 0) continue;
+        var cx = r.left + r.width / 2;
+        if (cx > w - 80) right = true;
+        if (cx < 80) left = true;
+      }
+    }
+    var key = left + ',' + right;
+    if (key === lastCorner) return;
+    lastCorner = key;
+    try { window.DmeeAndroid.setCornerBusy(left, right); } catch (err) {}
+  }
+
+  // ===== Chat: camera button next to the message box (like the Instagram app) =====
+  var CAM_SVG = '<svg viewBox="0 0 24 24" width="22" height="22" fill="#fff" fill-rule="evenodd"><path d="M9.2 4.5a1.6 1.6 0 0 0-1.4.8L7 6.6H5' +
+    'A2.5 2.5 0 0 0 2.5 9.1v8.4A2.5 2.5 0 0 0 5 20h14a2.5 2.5 0 0 0 2.5-2.5V9.1A2.5 2.5 0 0 0 19 6.6h-2l-.8-1.3a1.6 1.6 0 0 0-1.4-.8z' +
+    'M12 9.3a4 4 0 1 1 0 8 4 4 0 0 1 0-8zm0 2a2 2 0 1 0 0 4 2 2 0 0 0 0-4z"/></svg>';
+  var PHOTO_RE = /(photo|video|image|fotograf|slik|foto|immagin|imagen|bild|zdj)/i;
+  function composerParts() {
+    var box = document.querySelector('div[role="textbox"][contenteditable="true"], textarea');
+    if (!box) return null;
+    var br = box.getBoundingClientRect();
+    if (!br.width) return null;
+    // The rounded composer row around the text box.
+    var row = box.parentElement;
+    for (var d = 0; row && row !== document.body && d < 8; row = row.parentElement, d++) {
+      var rr = row.getBoundingClientRect();
+      if (rr.width > window.innerWidth * 0.7 && rr.height < 200) break;
+    }
+    if (!row || row === document.body) return null;
+    // Instagram's emoji button sits left of the text: our camera button takes its place.
+    var emoji = null, photo = null;
+    var btns = row.querySelectorAll('[role="button"], button');
+    for (var i = 0; i < btns.length; i++) {
+      var b = btns[i], r = b.getBoundingClientRect();
+      if (!r.width || r.width > 60) continue;
+      if (r.right <= br.left + 4 && !emoji) emoji = b;
+      var label = '';
+      var sv = b.querySelector('svg[aria-label]');
+      if (sv) label = sv.getAttribute('aria-label') || '';
+      if (PHOTO_RE.test(label)) photo = b;
+    }
+    // The whole bar: the outermost box around the text that still looks like a bar (wide, not tall).
+    var pill = row;
+    for (var el = row.parentElement, k = 0; el && el !== document.body && k < 6; el = el.parentElement, k++) {
+      var er = el.getBoundingClientRect();
+      if (er.height > 160 || er.width > window.innerWidth + 1) break;
+      if (er.width >= window.innerWidth * 0.8 && er.width <= window.innerWidth - 8) pill = el;
+    }
+    return { row: row, emoji: emoji, photo: photo, pill: pill };
+  }
+  // The chat partner's username (from the chat header), so Dmee can open this chat in Instagram.
+  function chatUsername() {
+    var links = document.querySelectorAll('a[href]');
+    for (var i = 0; i < links.length; i++) {
+      var m = /^\/([A-Za-z0-9._]{1,30})\/?$/.exec(links[i].getAttribute('href') || '');
+      if (!m || /^(direct|explore|reels|accounts|stories)$/.test(m[1])) continue;
+      var r = links[i].getBoundingClientRect();
+      if (r.width && r.top < 140) return m[1];
+    }
+    return '';
+  }
+  function openCamera(e) {
+    e.preventDefault(); e.stopPropagation();
+    // Dmee 1.1.3+: straight to Instagram's camera in this chat (view-once photos).
+    if (window.DmeeAndroid && window.DmeeAndroid.openChatCamera) {
+      try { window.DmeeAndroid.openChatCamera(chatUsername()); } catch (err) {}
+      return;
+    }
+    try { if (window.DmeeAndroid && window.DmeeAndroid.setChatUser) window.DmeeAndroid.setChatUser(chatUsername()); } catch (err) {}
+    try { if (window.DmeeAndroid && window.DmeeAndroid.cameraNext) window.DmeeAndroid.cameraNext(); } catch (err) {}
+    var parts = composerParts();
+    var input = (parts && parts.row.querySelector('input[type="file"]')) ||
+      document.querySelector('input[type="file"][accept*="image"]') || document.querySelector('input[type="file"]');
+    if (input) input.click();
+    else if (parts && parts.photo) parts.photo.click();
+  }
+  function updateCameraButton() {
+    var cam = document.getElementById('dmee-cam');
+    var parts = (onThread() && !window.__dmeeHidden && !reelViewerOpen() && !onStories() &&
+      !document.querySelector('[role="dialog"]')) ? composerParts() : null;
+    if (!parts) { if (cam) cam.style.display = 'none'; return; }
+    // The message bar like the Instagram app: a filled pill, no outline, camera inside on the left.
+    // Instagram's emoji button (left of the text) makes way for the camera; the keyboard has emojis.
+    if (parts.emoji && !parts.emoji.hasAttribute('data-dmee-noemoji')) parts.emoji.setAttribute('data-dmee-noemoji', '1');
+    if (!parts.row.hasAttribute('data-dmee-campad')) parts.row.setAttribute('data-dmee-campad', '1');
+    if (!parts.pill.hasAttribute('data-dmee-composer')) parts.pill.setAttribute('data-dmee-composer', '1');
+    {
+      // Remove Instagram's own outlines and fills inside the bar (they drew a second pill).
+      var inner = parts.pill.querySelectorAll('div, span, form');
+      for (var q = 0; q < inner.length; q++) {
+        var c = inner[q];
+        if (c.hasAttribute('data-dmee-clear') || c.closest('[role="textbox"], button, [role="button"]')) continue;
+        var cs = getComputedStyle(c);
+        if (parseFloat(cs.borderTopWidth) > 0 || cs.boxShadow !== 'none' ||
+            (cs.backgroundColor !== 'rgba(0, 0, 0, 0)' && cs.backgroundColor !== 'transparent')) c.setAttribute('data-dmee-clear', '1');
+      }
+    }
+    if (!document.getElementById('dmee-cam-style')) {
+      var st = document.createElement('style');
+      st.id = 'dmee-cam-style';
+      st.textContent =
+        // Same look as Dmee's floating menu: dark glass, thin light outline, round.
+        // Like the Instagram app: a filled dark-grey pill, no outline, a little gap from the edges.
+        '[data-dmee-composer]{background:#262626 !important;border:none !important;border-radius:28px !important;' +
+        'box-sizing:border-box !important;padding:2px 6px 2px 4px !important;min-height:0 !important;' +
+        'margin:0 10px 8px 10px !important;max-width:calc(100% - 20px) !important;}' +
+        '[data-dmee-clear]{border-color:transparent !important;box-shadow:none !important;background:transparent !important;outline:none !important;}' +
+        '[data-dmee-noemoji]{display:none !important;}' +
+        '[data-dmee-campad]{padding-left:40px !important;box-sizing:border-box !important;}';
+      (document.head || document.documentElement).appendChild(st);
+    }
+    if (!cam) {
+      cam = document.createElement('div');
+      cam.id = 'dmee-cam';
+      cam.setAttribute('role', 'button');
+      cam.setAttribute('aria-label', 'Camera');
+      cam.innerHTML = CAM_SVG;
+      cam.style.cssText = 'position:fixed;z-index:2147483000;width:38px;height:38px;border-radius:50%;' +
+        'background:#FF1F2D;display:flex;align-items:center;justify-content:center;' +
+        '-webkit-tap-highlight-color:transparent;touch-action:manipulation;';
+      cam.addEventListener('click', openCamera, true);
+      (document.body || document.documentElement).appendChild(cam);
+    }
+    // Right at the left end of the bar, like the Instagram app.
+    var pr = parts.pill.getBoundingClientRect();
+    var r = parts.row.getBoundingClientRect();
+    cam.style.left = Math.round(pr.left + 7) + 'px';
+    // A tall bar (photo preview, several lines): stay next to the last line.
+    if (r.height > 64) r = { top: r.bottom - 52, height: 52 };
+    cam.style.top = Math.round(r.top + r.height / 2 - 19) + 'px';
+    // Needs Dmee's Instagram lock: dimmed while it's off (a tap explains why).
+    var on = true;
+    try { if (window.DmeeAndroid && window.DmeeAndroid.isLockOn) on = window.DmeeAndroid.isLockOn(); } catch (err) {}
+    cam.style.opacity = on ? '1' : '0.4';
+    cam.style.display = 'flex';
+  }
+  window.addEventListener('resize', function () { setTimeout(updateCameraButton, 50); });
+  if (window.visualViewport) window.visualViewport.addEventListener('resize', function () { setTimeout(updateCameraButton, 50); });
+
+
+  // ===== Home tab: posts only from the accounts YOU added (no algorithm, no endless feed) =====
+  // Accounts are added with the "+ Add to feed" button on their profile. Dmee keeps the list;
+  // the posts are loaded from Instagram's own website data, newest first, last 3 weeks only.
+  var FEED_APP_ID = '936619743392459';
+  var feedState = { loading: false, key: '', items: null };
+  function feedText(k, fallback) {
+    try {
+      if (!window.__dmeeFeedStrings && window.DmeeAndroid && window.DmeeAndroid.feedStrings)
+        window.__dmeeFeedStrings = JSON.parse(window.DmeeAndroid.feedStrings());
+    } catch (err) {}
+    return (window.__dmeeFeedStrings && window.__dmeeFeedStrings[k]) || fallback;
+  }
+  function feedAccounts() {
+    try { return JSON.parse(window.DmeeAndroid.getFeedAccounts()) || []; } catch (err) { return null; }
+  }
+  function escapeHtml(t) {
+    return String(t || '').replace(/[&<>"']/g, function (c) {
+      return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
+    });
+  }
+  function timeAgo(sec) {
+    var d = Math.max(0, Date.now() / 1000 - sec);
+    if (d < 3600) return Math.max(1, Math.round(d / 60)) + 'm';
+    if (d < 86400) return Math.round(d / 3600) + 'h';
+    return Math.round(d / 86400) + 'd';
+  }
+  function dmeeLog(msg) {
+    try { if (window.DmeeAndroid && window.DmeeAndroid.log) window.DmeeAndroid.log(String(msg)); } catch (err) {}
+  }
+  function igHeaders() {
+    var m = /(?:^|;\s*)csrftoken=([^;]+)/.exec(document.cookie || '');
+    return { 'X-IG-App-ID': FEED_APP_ID, 'X-Requested-With': 'XMLHttpRequest', 'X-ASBD-ID': '129477',
+      'X-CSRFToken': m ? m[1] : '', 'Accept': 'application/json' };
+  }
+  function igGet(url) {
+    return fetch(url, { credentials: 'include', headers: igHeaders() }).then(function (r) {
+      dmeeLog('feed ' + r.status + ' ' + url.split('?')[0]);
+      if (r.status === 429 || r.status === 401) {
+        // Instagram says "slow down": no feed requests for 15 minutes.
+        try { localStorage.setItem('dmee-feed-pause', String(Date.now() + 10 * 60 * 1000)); } catch (err) {}
+      }
+      var ct = r.headers.get('content-type') || '';
+      return (r.ok && ct.indexOf('json') >= 0) ? r.json() : null;
+    }).catch(function (e) { dmeeLog('feed error ' + e); return null; });
+  }
+  function postFromItem(it, user) {
+    var media = (it.carousel_media && it.carousel_media[0]) || it;
+    var cands = (media.image_versions2 && media.image_versions2.candidates) || [];
+    var best = cands[0] || {};
+    return {
+      user: user.username, pic: user.profile_pic_url, code: it.code, img: best.url,
+      w: best.width || it.original_width || 1, h: best.height || it.original_height || 1,
+      t: it.taken_at, video: it.media_type === 2, many: it.media_type === 8,
+      caption: (it.caption && it.caption.text) || ''
+    };
+  }
+  function loadAccount(user) {
+    var cacheKey = 'dmee-feed2-' + user;
+    try {
+      var c = JSON.parse(localStorage.getItem(cacheKey) || 'null');
+      if (c && Date.now() - c.t < 2 * 60 * 60 * 1000) return Promise.resolve(c.posts); // 2 h: gentle on Instagram
+      if (Date.now() < +(localStorage.getItem('dmee-feed-pause') || 0)) {
+        dmeeLog('feed paused ' + Math.round((+localStorage.getItem('dmee-feed-pause') - Date.now()) / 60000) + ' more min ' + user);
+        feedState.paused = true;
+        return Promise.resolve(c ? c.posts : []);
+      }
+    } catch (err) {}
+    var since = Date.now() / 1000 - 21 * 86400;
+    return Promise.resolve().then(function () {
+      if (Date.now() < +(localStorage.getItem('dmee-feed-pause') || 0)) return null;
+      return igGet('/api/v1/users/web_profile_info/?username=' + encodeURIComponent(user)).then(function (j) {
+      var u = j && j.data && j.data.user;
+      if (!u) return null;
+      var edges = (u.edge_owner_to_timeline_media && u.edge_owner_to_timeline_media.edges) || [];
+      var posts = [];
+      for (var i = 0; i < edges.length && posts.length < 6; i++) {
+        var n = edges[i].node || {};
+        if (!n.shortcode || (n.taken_at_timestamp || 0) < since) continue;
+        var cap = n.edge_media_to_caption && n.edge_media_to_caption.edges && n.edge_media_to_caption.edges[0];
+        posts.push({
+          user: u.username, pic: u.profile_pic_url, code: n.shortcode, img: n.display_url || n.thumbnail_src,
+          w: (n.dimensions && n.dimensions.width) || 1, h: (n.dimensions && n.dimensions.height) || 1,
+          t: n.taken_at_timestamp, video: !!n.is_video, many: n.__typename === 'GraphSidecar',
+          caption: cap ? cap.node.text : ''
+        });
+      }
+      if (edges.length || !u.id) return posts;
+      // Newer Instagram: the posts aren't in the profile data any more; ask for the account's posts.
+      return igGet('/api/v1/feed/user/' + u.id + '/?count=12').then(function (f) {
+        var items = (f && f.items) || [];
+        var out = [];
+        for (var k = 0; k < items.length && out.length < 6; k++) {
+          if ((items[k].taken_at || 0) < since || !items[k].code) continue;
+          out.push(postFromItem(items[k], { username: u.username, profile_pic_url: u.profile_pic_url }));
+        }
+        return out;
+      });
+      });
+    }).then(function (posts) {
+      if (!posts) { dmeeLog('feed ' + user + ': not loaded'); return []; } // not cached: try again later
+      dmeeLog('feed ' + user + ': ' + posts.length + ' posts');
+      try { localStorage.setItem(cacheKey, JSON.stringify({ t: Date.now(), posts: posts })); } catch (err) {}
+      return posts;
+    }).catch(function (e) { dmeeLog('feed error ' + user + ' ' + e); return []; });
+  }
+  function feedBox() {
+    var box = document.getElementById('dmee-feed');
+    if (!box) {
+      box = document.createElement('div');
+      box.id = 'dmee-feed';
+      // Above everything of Instagram's page (taps must never reach the stories under it).
+      box.style.cssText = 'position:fixed;left:0;right:0;bottom:0;z-index:2147480000;overflow-y:auto;' +
+        '-webkit-overflow-scrolling:touch;background:#000;padding:4px 0 120px;box-sizing:border-box;' +
+        'font-family:-apple-system,system-ui,Roboto,sans-serif;color:#fff;';
+      box.addEventListener('scroll', function () { reportAtTop(box); playFeedVideos(); }, { passive: true });
+      (document.body || document.documentElement).appendChild(box);
+    }
+    return box;
+  }
+  // ---- One post, drawn like Instagram: header, swipeable photos, actions, likes, caption, comments ----
+  var ICON = {
+    heart: '<svg viewBox="0 0 24 24" width="26" height="26" fill="none" stroke="#fff" stroke-width="1.9" stroke-linejoin="round"><path d="M12 20.6C11.6 20.6 3 15.2 3 9.2 3 6.3 5.2 4 8 4c1.7 0 3.2.9 4 2.3C12.8 4.9 14.3 4 16 4c2.8 0 5 2.3 5 5.2 0 6-8.6 11.4-9 11.4z"/></svg>',
+    heartOn: '<svg viewBox="0 0 24 24" width="26" height="26" fill="#FF3040" stroke="#FF3040" stroke-width="1.9" stroke-linejoin="round"><path d="M12 20.6C11.6 20.6 3 15.2 3 9.2 3 6.3 5.2 4 8 4c1.7 0 3.2.9 4 2.3C12.8 4.9 14.3 4 16 4c2.8 0 5 2.3 5 5.2 0 6-8.6 11.4-9 11.4z"/></svg>',
+    comment: '<svg viewBox="0 0 24 24" width="25" height="25" fill="none" stroke="#fff" stroke-width="1.9" stroke-linejoin="round"><path d="M20.7 16.7A9 9 0 1 0 17 20.4L21.5 21.5z"/></svg>',
+    share: '<svg viewBox="0 0 24 24" width="25" height="25" fill="none" stroke="#fff" stroke-width="1.9" stroke-linejoin="round"><path d="M22 3 9.2 10.1M22 3l-7 19-4.4-9.4L2 9z"/></svg>',
+    save: '<svg viewBox="0 0 24 24" width="25" height="25" fill="none" stroke="#fff" stroke-width="1.9" stroke-linejoin="round"><path d="M19 21l-7-6-7 6V3h14z"/></svg>',
+    saveOn: '<svg viewBox="0 0 24 24" width="25" height="25" fill="#fff" stroke="#fff" stroke-width="1.9" stroke-linejoin="round"><path d="M19 21l-7-6-7 6V3h14z"/></svg>',
+    muted: '<svg viewBox="0 0 24 24" width="14" height="14" fill="#fff"><path d="M3 9v6h4l5 4V5L7 9zm13.6 3 2.7-2.7-1.2-1.2-2.7 2.7-2.7-2.7-1.2 1.2 2.7 2.7-2.7 2.7 1.2 1.2 2.7-2.7 2.7 2.7 1.2-1.2z"/></svg>',
+    sound: '<svg viewBox="0 0 24 24" width="14" height="14" fill="#fff"><path d="M3 9v6h4l5 4V5L7 9zm11.5 3A4.5 4.5 0 0 0 12 8v8a4.5 4.5 0 0 0 2.5-4zM14 3.2v2.1a7 7 0 0 1 0 13.4v2.1a9 9 0 0 0 0-17.6z"/></svg>'
+  };
+  var feedMuted = true;
+  function fmtCount(n) {
+    n = +n || 0;
+    if (n >= 1e6) return (n / 1e6).toFixed(n >= 1e7 ? 0 : 1).replace(/\.0$/, '') + 'M';
+    if (n >= 1e4) return Math.round(n / 1e3) + 'K';
+    if (n >= 1e3) return (n / 1e3).toFixed(1).replace(/\.0$/, '') + 'K';
+    return String(n);
+  }
+  function postCard(p) {
+    var ratio = Math.min(1.25, Math.max(0.8, p.h / p.w));
+    var slides = (p.slides && p.slides.length) ? p.slides : [{ u: p.img, v: p.video }];
+    var media = '';
+    for (var s = 0; s < slides.length; s++) {
+      var vs = slides[s].m || '';
+      media += '<div style="flex:0 0 100%;position:relative;scroll-snap-align:start;background:#111">' +
+        (vs ? '<video class="dmee-vid" src="' + escapeHtml(vs) + '" poster="' + escapeHtml(slides[s].u) + '" muted playsinline loop ' +
+          'preload="none" style="position:absolute;inset:0;width:100%;height:100%;object-fit:cover"></video>' +
+          '<div class="dmee-mute" style="position:absolute;right:10px;bottom:10px;width:26px;height:26px;border-radius:50%;' +
+          'background:rgba(0,0,0,.6);display:flex;align-items:center;justify-content:center;pointer-events:none">' +
+          (feedMuted ? ICON.muted : ICON.sound) + '</div>' :
+        '<img src="' + escapeHtml(slides[s].u) + '" loading="lazy" referrerpolicy="no-referrer" draggable="false" ' +
+        'style="position:absolute;inset:0;width:100%;height:100%;object-fit:cover">' +
+        (slides[s].v ? '<div style="position:absolute;top:12px;right:12px;font-size:16px;opacity:.9">&#9654;</div>' : '')) + '</div>';
+    }
+    var dots = '';
+    if (slides.length > 1) {
+      for (var d = 0; d < slides.length; d++)
+        dots += '<span style="width:' + (slides.length > 6 ? 5 : 6) + 'px;height:' + (slides.length > 6 ? 5 : 6) +
+          'px;border-radius:50%;background:' + (d ? '#555' : '#0095f6') + '"></span>';
+      dots = '<div class="dmee-dots" style="display:flex;gap:4px;justify-content:center;position:absolute;left:0;right:0;top:12px">' + dots + '</div>';
+    }
+    var counter = slides.length > 1 ? '<div class="dmee-count" style="position:absolute;top:12px;right:12px;background:rgba(0,0,0,.6);' +
+      'border-radius:12px;padding:3px 9px;font-size:12px;font-weight:600">1/' + slides.length + '</div>' : '';
+    var cap = p.caption ? '<div class="dmee-cap" data-act="more" style="padding:6px 14px 0;font-size:14px;line-height:1.4;color:#f5f5f5;' +
+      'display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;white-space:pre-line"><b>' +
+      escapeHtml(p.user) + '</b> ' + escapeHtml(p.caption) + '</div>' : '';
+    return '<div class="dmee-post" data-code="' + escapeHtml(p.code) + '" data-id="' + escapeHtml(p.id || '') +
+      '" data-liked="' + (p.liked ? 1 : 0) + '" data-saved="' + (p.saved ? 1 : 0) + '" data-likes="' + (+p.likes || 0) + '" style="margin-bottom:26px">' +
+      // header
+      '<div style="display:flex;align-items:center;gap:10px;padding:8px 14px">' +
+      '<a href="/' + escapeHtml(p.user) + '/" style="display:flex;align-items:center;gap:10px;color:#fff;text-decoration:none">' +
+      '<img src="' + escapeHtml(p.pic) + '" referrerpolicy="no-referrer" style="width:32px;height:32px;border-radius:50%;object-fit:cover;background:#222">' +
+      '<span style="font-weight:600;font-size:14px">' + escapeHtml(p.user) + '</span></a>' +
+      '<span style="color:#8e8e93;font-size:14px">&middot; ' + timeAgo(p.t) + '</span></div>' +
+      // photos
+      '<div style="position:relative;width:100%;padding-top:' + (ratio * 100).toFixed(2) + '%">' +
+      '<div class="dmee-media" style="position:absolute;inset:0;display:flex;overflow-x:auto;scroll-snap-type:x mandatory;' +
+      '-webkit-overflow-scrolling:touch;scrollbar-width:none">' + media + '</div>' + counter +
+      '<div class="dmee-bigheart" style="position:absolute;left:50%;top:50%;transform:translate(-50%,-50%) scale(0);opacity:0;' +
+      'transition:transform .25s cubic-bezier(.2,1.6,.4,1),opacity .25s;pointer-events:none">' +
+      ICON.heartOn.replace('width="26" height="26"', 'width="96" height="96"') + '</div></div>' +
+      (dots ? '<div style="position:relative;height:14px;pointer-events:none">' + dots.replace('top:12px', 'top:8px') + '</div>' : '') +
+      // actions: like / comment / share ... save
+      '<div style="display:flex;align-items:center;padding:' + (dots ? '0' : '8px') + ' 12px 0;gap:16px">' +
+      '<div data-act="like" style="display:flex;align-items:center;gap:6px"><span class="dmee-heart" style="display:flex">' + (p.liked ? ICON.heartOn : ICON.heart) +
+      '</span><span class="dmee-likes" style="font-weight:600;font-size:14px">' + fmtCount(p.likes) + '</span></div>' +
+      '<div data-act="comment" style="display:flex;align-items:center;gap:6px">' + ICON.comment +
+      '<span style="font-weight:600;font-size:14px">' + fmtCount(p.comments) + '</span></div>' +
+      '<div data-act="share">' + ICON.share + '</div>' +
+      '<div data-act="save" class="dmee-save" style="margin-left:auto">' + (p.saved ? ICON.saveOn : ICON.save) + '</div></div>' +
+      cap +
+      (p.comments ? '<div data-act="comment" style="padding:6px 14px 0;font-size:14px;color:#8e8e93">' +
+        escapeHtml(feedText('view_comments', 'View all %d comments').replace('%d', fmtCount(p.comments))) + '</div>' : '') +
+      '</div>';
+  }
+  function setLikeUi(post, liked) {
+    var n = Math.max(0, (+post.getAttribute('data-likes') || 0) + (liked ? 1 : -1));
+    post.setAttribute('data-liked', liked ? 1 : 0);
+    post.setAttribute('data-likes', n);
+    var h = post.querySelector('.dmee-heart'); if (h) h.innerHTML = liked ? ICON.heartOn : ICON.heart;
+    var c = post.querySelector('.dmee-likes'); if (c) c.textContent = fmtCount(n);
+  }
+  function toggleLike(post, forceLike) {
+    var liked = post.getAttribute('data-liked') === '1';
+    if (forceLike && liked) return;
+    var want = forceLike ? true : !liked;
+    var id = post.getAttribute('data-id'), code = post.getAttribute('data-code');
+    setLikeUi(post, want);
+    // Instagram's website has no "like" request any more: Dmee presses the real like button on
+    // the post's page (invisible) and tells us whether it worked.
+    try { window.DmeeAndroid.likePost(code, want); } catch (err) { setLikeUi(post, !want); }
+  }
+  window.__dmeeLikeResult = function (code, ok, liked) {
+    var post = document.querySelector('#dmee-feed .dmee-post[data-code="' + code + '"]');
+    if (!post) return;
+    if ((post.getAttribute('data-liked') === '1') !== liked) setLikeUi(post, liked);
+    dmeeLog('like ' + code + ' ok=' + ok + ' liked=' + liked);
+  };
+  // Save: like the heart, Dmee presses Instagram's own Save button on the (invisible) post page.
+  function setSaveUi(post, saved) {
+    post.setAttribute('data-saved', saved ? 1 : 0);
+    var b = post.querySelector('.dmee-save'); if (b) b.innerHTML = saved ? ICON.saveOn : ICON.save;
+  }
+  function toggleSave(post) {
+    var want = post.getAttribute('data-saved') !== '1';
+    setSaveUi(post, want);
+    try { window.DmeeAndroid.savePost(post.getAttribute('data-code'), want); } catch (err) { setSaveUi(post, !want); }
+  }
+  window.__dmeeSaveResult = function (code, ok, saved) {
+    var post = document.querySelector('#dmee-feed .dmee-post[data-code="' + code + '"]');
+    if (post && (post.getAttribute('data-saved') === '1') !== saved) setSaveUi(post, saved);
+    dmeeLog('save ' + code + ' ok=' + ok + ' saved=' + saved);
+  };
+  // Videos: the one you're looking at plays (muted, like Instagram); tap it for sound.
+  function playFeedVideos() {
+    var box = document.getElementById('dmee-feed');
+    var vids = box ? box.querySelectorAll('video.dmee-vid') : [];
+    if (!vids.length) return;
+    var on = box.style.display !== 'none' && !window.__dmeeHidden, best = null, bestArea = 0;
+    var vh = window.innerHeight, vw = window.innerWidth;
+    for (var i = 0; i < vids.length; i++) {
+      var r = vids[i].getBoundingClientRect();
+      var w = Math.max(0, Math.min(r.right, vw) - Math.max(r.left, 0));
+      var h = Math.max(0, Math.min(r.bottom, vh) - Math.max(r.top, 0));
+      var a = (w * h) / Math.max(1, r.width * r.height);
+      if (on && a > 0.6 && a > bestArea) { best = vids[i]; bestArea = a; }
+    }
+    for (var k = 0; k < vids.length; k++) {
+      var v = vids[k];
+      if (v === best) {
+        v.muted = feedMuted;
+        if (v.paused) { if (v.preload !== 'auto') v.preload = 'auto'; var pr = v.play(); if (pr && pr.catch) pr.catch(function () {}); }
+      } else if (!v.paused) v.pause();
+    }
+  }
+  function toggleFeedSound() {
+    feedMuted = !feedMuted;
+    var vids = document.querySelectorAll('#dmee-feed video.dmee-vid');
+    for (var i = 0; i < vids.length; i++) vids[i].muted = feedMuted;
+    var m = document.querySelectorAll('#dmee-feed .dmee-mute');
+    for (var j = 0; j < m.length; j++) m[j].innerHTML = feedMuted ? ICON.muted : ICON.sound;
+  }
+  function bigHeart(post) {
+    var h = post.querySelector('.dmee-bigheart'); if (!h) return;
+    h.style.opacity = '1'; h.style.transform = 'translate(-50%,-50%) scale(1)';
+    setTimeout(function () { h.style.opacity = '0'; h.style.transform = 'translate(-50%,-50%) scale(0)'; }, 700);
+  }
+  var lastMediaTap = 0;
+  document.addEventListener('click', function (e) {
+    var post = e.target.closest && e.target.closest('#dmee-feed .dmee-post');
+    if (!post) return;
+    if (e.target.closest('a')) return; // profile link: normal navigation
+    e.preventDefault();
+    var act = e.target.closest('[data-act]');
+    var a = act ? act.getAttribute('data-act') : (e.target.closest('.dmee-media') ? 'media' : '');
+    if (a === 'like') toggleLike(post, false);
+    else if (a === 'comment' || a === 'share') {
+      try { window.DmeeAndroid.openPostSheet(post.getAttribute('data-code'), a); }
+      catch (err) { location.href = '/p/' + post.getAttribute('data-code') + '/'; }
+    }
+    else if (a === 'save') toggleSave(post);
+    else if (a === 'more') { act.style.webkitLineClamp = 'unset'; act.style.display = 'block'; }
+    else if (a === 'media') {
+      // Double-tap the photo to like (single tap does nothing, like Instagram).
+      var now = Date.now();
+      clearTimeout(window.__dmeeTapT);
+      if (now - lastMediaTap < 320) { bigHeart(post); toggleLike(post, true); lastMediaTap = 0; }
+      else {
+        lastMediaTap = now;
+        // Single tap on a video: sound on/off (after waiting to see it's not a double tap).
+        var slide = e.target.closest('.dmee-media > div');
+        if (slide && slide.querySelector('video.dmee-vid')) window.__dmeeTapT = setTimeout(toggleFeedSound, 330);
+      }
+    }
+  }, true);
+  // Swiping photos: dots + "2/5" follow along.
+  document.addEventListener('scroll', function (e) {
+    var m = e.target;
+    if (!m || !m.classList || !m.classList.contains('dmee-media')) return;
+    var post = m.closest('.dmee-post'); if (!post) return;
+    var idx = Math.round(m.scrollLeft / Math.max(1, m.clientWidth));
+    var dots = post.querySelectorAll('.dmee-dots span');
+    for (var k = 0; k < dots.length; k++) dots[k].style.background = k === idx ? '#0095f6' : '#555';
+    var c = post.querySelector('.dmee-count'); if (c) c.textContent = (idx + 1) + '/' + dots.length;
+    playFeedVideos();
+  }, true);
+
+  function renderFeed(box, accounts) {
+    var items = feedState.items || [];
+    var html = '';
+    if (!accounts.length) {
+      html = '<div style="padding:40px 28px;text-align:center;color:#a8a8ad;font-size:15px;line-height:1.45">' +
+        '<div style="font-size:19px;font-weight:700;color:#fff;margin-bottom:8px">' +
+        escapeHtml(feedText('empty_title', 'Your feed is empty')) + '</div>' +
+        escapeHtml(feedText('empty_text', "Open someone's profile and tap + Add to feed. Only their posts show up here, nothing else.")) +
+        '</div>';
+    } else if (feedState.loading && !items.length) {
+      for (var s = 0; s < 2; s++) {
+        html += '<div style="padding:10px 14px"><div class="dmee-sk" style="height:12px;width:40%;border-radius:6px"></div></div>' +
+          '<div class="dmee-sk" style="width:100%;aspect-ratio:1/1"></div>';
+      }
+    } else {
+      for (var i = 0; i < items.length; i++) html += postCard(items[i]);
+      html += '<div style="padding:28px 20px;text-align:center;color:#8e8e93;font-size:14px">' +
+        (items.length ? '&#10003; ' + escapeHtml(feedText('caught_up', "You're all caught up")) :
+          feedState.paused ? escapeHtml(feedText('paused', 'Instagram needs a short break. Posts load again in a few minutes.')) :
+          escapeHtml(feedText('no_posts', 'No new posts in the last 3 weeks'))) + '</div>';
+    }
+    box.innerHTML = html;
+    setTimeout(playFeedVideos, 50);
+  }
+  // Dmee loads the posts itself (invisible profile pages, gentle on Instagram) and hands them over.
+  function readFeed() {
+    var items = [], loading = false;
+    try { items = JSON.parse(window.DmeeAndroid.getFeedPosts()) || []; } catch (err) {}
+    try { loading = !!window.DmeeAndroid.feedLoading(); } catch (err) {}
+    feedState.items = items;
+    feedState.loading = loading;
+    feedState.paused = false;
+    var box = document.getElementById('dmee-feed');
+    var accounts = feedAccounts();
+    if (box && accounts) renderFeed(box, accounts);
+  }
+  function loadFeed(accounts, force) {
+    feedState.key = accounts.join(',');
+    try { window.DmeeAndroid.refreshFeed(!!force); } catch (err) {}
+    readFeed();
+  }
+  window.__dmeeFeedRefresh = function () { readFeed(); };
+  var lastFeedWhy = '';
+  function updateFeed(force) {
+    var box = document.getElementById('dmee-feed');
+    var accounts = (location.pathname === '/' && !window.__dmeeHidden) ? feedAccounts() : null;
+    if (location.pathname === '/') {
+      var why = 'hidden=' + !!window.__dmeeHidden + ' accounts=' + (accounts ? accounts.length : 'none') +
+        ' stories=' + document.documentElement.hasAttribute('data-dmee-stories');
+      if (why !== lastFeedWhy) { lastFeedWhy = why; dmeeLog('feed state ' + why); }
+    }
+    if (!accounts || !document.documentElement.hasAttribute('data-dmee-stories')) {
+      if (box) box.style.display = 'none';
+      document.documentElement.removeAttribute('data-dmee-feedon');
+      return;
+    }
+    var tray = findStoryTray();
+    var top = tray ? Math.max(0, tray.getBoundingClientRect().bottom + 6) : 140;
+    box = feedBox();
+    // The page behind the feed must not scroll (it made the stories row jump).
+    if (!document.documentElement.hasAttribute('data-dmee-feedon')) {
+      document.documentElement.setAttribute('data-dmee-feedon', '1');
+      window.scrollTo(0, 0);
+    }
+    if (!box.__dmeeTop || Math.abs(box.__dmeeTop - top) > 4) { box.__dmeeTop = top; box.style.top = Math.round(top) + 'px'; }
+    box.style.display = 'block';
+    if (!document.getElementById('dmee-feed-style')) {
+      var st = document.createElement('style');
+      st.id = 'dmee-feed-style';
+      st.textContent = '@keyframes dmeeShim{0%{background-position:-200px 0}100%{background-position:400px 0}}' +
+        '.dmee-sk{background:#1a1a1c linear-gradient(90deg,#1a1a1c 0,#2e2e32 60px,#1a1a1c 120px) no-repeat;' +
+        'background-size:200px 100%;animation:dmeeShim 1.3s linear infinite}' +
+        'html[data-dmee-feedon],html[data-dmee-feedon] body{overflow:hidden !important;overscroll-behavior:none !important}' +
+        '#dmee-feed::-webkit-scrollbar,.dmee-media::-webkit-scrollbar{display:none}' +
+        // Instagram's own icon styles must not change our icons (they cut / mirrored the hearts).
+        '#dmee-feed svg{display:block;flex:none;overflow:visible;transform:none;max-width:none;max-height:none;position:static}' +
+        '#dmee-feed svg path{transform:none;fill-rule:nonzero}' +
+        '#dmee-feed .dmee-bigheart svg{width:96px;height:96px}';
+      (document.head || document.documentElement).appendChild(st);
+    }
+    if (force || feedState.key !== accounts.join(',')) { loadFeed(accounts, !!force); renderFeed(box, accounts); }
+    else if (!box.firstChild) renderFeed(box, accounts);
+  }
+
+  // ===== "+ Add to feed" on someone's profile =====
+  var PROFILE_SKIP = /^(direct|accounts|explore|reels|reel|p|tv|stories|notifications|challenge|legal|about|web|api)$/;
+  function profileUser() {
+    var m = /^\/([A-Za-z0-9._]{1,30})\/?$/.exec(location.pathname);
+    if (!m || PROFILE_SKIP.test(m[1])) return null;
+    if (reportedUser && m[1].toLowerCase() === String(reportedUser).toLowerCase()) return null;
+    return m[1];
+  }
+  function updateAddButton() {
+    var b = document.getElementById('dmee-addfeed');
+    var user = (!window.__dmeeHidden && !reelViewerOpen()) ? profileUser() : null;
+    var list = user ? feedAccounts() : null;
+    if (!user || !list) { if (b) b.style.display = 'none'; return; }
+    if (!b) {
+      b = document.createElement('div');
+      b.id = 'dmee-addfeed';
+      b.setAttribute('role', 'button');
+      b.style.cssText = 'position:fixed;left:50%;transform:translateX(-50%);bottom:104px;z-index:2147483000;' +
+        'padding:11px 20px;border-radius:999px;font:600 15px -apple-system,system-ui,Roboto,sans-serif;' +
+        'box-shadow:0 6px 20px rgba(0,0,0,.45);-webkit-tap-highlight-color:transparent;white-space:nowrap;';
+      b.addEventListener('click', function (e) {
+        e.preventDefault(); e.stopPropagation();
+        var u = b.getAttribute('data-user');
+        try { window.DmeeAndroid.toggleFeedAccount(u); } catch (err) {}
+        b.removeAttribute('data-state');
+        updateAddButton();
+      }, true);
+      (document.body || document.documentElement).appendChild(b);
+    }
+    var inFeed = list.map(function (x) { return x.toLowerCase(); }).indexOf(user.toLowerCase()) >= 0;
+    var state = user + ':' + inFeed;
+    if (b.getAttribute('data-state') !== state) {
+      b.setAttribute('data-state', state);
+      b.setAttribute('data-user', user);
+      b.textContent = inFeed ? '✓ ' + feedText('added', 'In your feed') : '+ ' + feedText('add', 'Add to feed');
+      b.style.background = inFeed ? 'rgba(28,28,31,0.95)' : '#FF1F2D';
+      b.style.color = '#fff';
+      b.style.border = inFeed ? '1px solid rgba(255,255,255,0.18)' : '1px solid transparent';
+    }
+    b.style.display = 'block';
+  }
+
+  // ===== Reel: shimmer skeleton until the video really plays =====
+  function updateReelSkeleton() {
+    var sk = document.getElementById('dmee-reel-sk');
+    var v = (!window.__dmeeHidden && reelViewerOpen()) ? mainReelVideo() : null;
+    var waiting = v && !(v.readyState >= 3 && v.currentTime > 0.05);
+    if (v && !v.__dmeeSkWatch) {
+      v.__dmeeSkWatch = true;
+      v.__dmeeSkSince = Date.now();
+      v.addEventListener('playing', function () { setTimeout(updateReelSkeleton, 30); });
+      v.addEventListener('timeupdate', function () { if (document.getElementById('dmee-reel-sk')) updateReelSkeleton(); });
+    }
+    if (waiting && Date.now() - (v.__dmeeSkSince || 0) > 8000) waiting = false; // never forever
+    if (!waiting) { if (sk) sk.style.display = 'none'; return; }
+    if (!sk) {
+      sk = document.createElement('div');
+      sk.id = 'dmee-reel-sk';
+      sk.style.cssText = 'position:fixed;inset:0;z-index:2147482000;pointer-events:none;background:#000;';
+      sk.innerHTML =
+        '<div class="dmee-sk" style="position:absolute;left:0;right:0;top:12%;bottom:22%;border-radius:0"></div>' +
+        '<div class="dmee-sk" style="position:absolute;left:16px;bottom:15%;width:36px;height:36px;border-radius:50%"></div>' +
+        '<div class="dmee-sk" style="position:absolute;left:62px;bottom:calc(15% + 12px);width:40%;height:12px;border-radius:6px"></div>' +
+        '<div class="dmee-sk" style="position:absolute;left:16px;bottom:11%;width:70%;height:11px;border-radius:6px"></div>' +
+        '<div class="dmee-sk" style="position:absolute;right:16px;bottom:30%;width:30px;height:30px;border-radius:50%"></div>' +
+        '<div class="dmee-sk" style="position:absolute;right:16px;bottom:calc(30% + 56px);width:30px;height:30px;border-radius:50%"></div>';
+      (document.body || document.documentElement).appendChild(sk);
+    }
+    if (!document.getElementById('dmee-sk-style')) {
+      var st = document.createElement('style');
+      st.id = 'dmee-sk-style';
+      st.textContent = '@keyframes dmeeShim{0%{background-position:-200px 0}100%{background-position:400px 0}}' +
+        '.dmee-sk{background:#1a1a1c linear-gradient(90deg,#1a1a1c 0,#2e2e32 60px,#1a1a1c 120px) no-repeat;' +
+        'background-size:200px 100%;animation:dmeeShim 1.3s linear infinite}';
+      (document.head || document.documentElement).appendChild(st);
+    }
+    sk.style.display = 'block';
+  }
+
+  // ===== Vanish mode messages: instagram.com can't show them -> offer to open the chat in Instagram =====
+  var VANISH_RE = /(vanish mode|disappearing messages|can.t be shown here|isn.t supported|izginjajo|nicht unterst|modo temporal|mode éphémère|modalità effimera|nestajuć|znikając)/i;
+  function updateVanishBanner() {
+    var b = document.getElementById('dmee-vanish');
+    var show = false;
+    if (onThread() && !window.__dmeeHidden && window.DmeeAndroid && window.DmeeAndroid.openChatInApp) {
+      var main = document.querySelector('main, [role="main"]') || document.body;
+      show = VANISH_RE.test((main && main.innerText || '').slice(-4000));
+    }
+    if (!show) { if (b) b.style.display = 'none'; return; }
+    if (!b) {
+      b = document.createElement('div');
+      b.id = 'dmee-vanish';
+      b.setAttribute('role', 'button');
+      b.style.cssText = 'position:fixed;left:50%;transform:translateX(-50%);top:78px;z-index:2147483000;' +
+        'padding:9px 16px;border-radius:999px;background:rgba(28,28,31,0.95);border:1px solid rgba(255,255,255,0.18);' +
+        'color:#fff;font:600 13px -apple-system,system-ui,Roboto,sans-serif;white-space:nowrap;' +
+        'box-shadow:0 6px 20px rgba(0,0,0,.45);-webkit-tap-highlight-color:transparent;';
+      b.textContent = feedText('vanish', 'Vanish mode messages only show in Instagram') + '  ›';
+      b.addEventListener('click', function (e) {
+        e.preventDefault(); e.stopPropagation();
+        try { window.DmeeAndroid.openChatInApp(chatUsername()); } catch (err) {}
+      }, true);
+      (document.body || document.documentElement).appendChild(b);
+    }
+    b.style.display = 'block';
+  }
+
+  // A tab in the background: keep hiding the feed etc., skip everything that only matters on screen.
+  var lastHiddenRun = 0;
+  function runHidden() {
+    if (Date.now() - lastHiddenRun < 1000) return;
+    lastHiddenRun = Date.now();
+    hideInstagramNavBar();
+    removeSuggestedReels();
+    reportUsername();
+    hideProfileExtras();
+    hideAppPromos();
+    hideStoryPlaceholder();
+    isolateStories();
+    hideDiscoverOnActivity();
+    padForTabBar();
+    pauseAllMedia();
+  }
+
   function run() {
     addStyle();
+    // Tabs in the background only do the minimum (keeps older phones fast).
+    if (window.__dmeeHidden) { runHidden(); return; }
     hideInstagramNavBar();
     hideInboxBackArrow();
     removeSuggestedReels();
@@ -1254,7 +1960,14 @@
     reportSearching();
     reportReel();
     fixSqueezedNames();
-    if (window.__dmeeHidden) pauseAllMedia();
+    hideTopNotices();
+    reportCornerClose();
+    updateCameraButton();
+    updateFeed();
+    playFeedVideos();
+    updateAddButton();
+    updateReelSkeleton();
+    updateVanishBanner();
   }
 
   // Instagram changes the page constantly (videos, lazy images). Running on every change made
@@ -1296,13 +2009,20 @@
   document.addEventListener('DOMContentLoaded', run);
   // Suggested reels can load without a big DOM change, so also check regularly.
   setInterval(function () {
-    if (window.__dmeeHidden) pauseAllMedia();
+    if (window.__dmeeHidden) { pauseAllMedia(); return; }
+    reportCornerClose();
+    updateCameraButton();
+    updateFeed();
+    playFeedVideos();
+    updateAddButton();
+    updateReelSkeleton();
+    updateVanishBanner();
     unmuteReel();
     update2xButton();
     reportReel();
     fixSqueezedNames();
     hideStoryPlaceholder();
-    if (!document.querySelector('video')) return;
+    if (!document.querySelector('video:not(.dmee-vid)')) return;
     removeSuggestedReels();
     fillReelWidth();
   }, 500);
