@@ -1,4 +1,4 @@
-// dmee-rules-version: 30
+// dmee-rules-version: 48
 // Injected into instagram.com. Hides every way into the Feed, Reels tab and Explore.
 // Instagram's class names change often, so we target link destinations instead.
 (function () {
@@ -191,6 +191,7 @@
 
   // Extra safety: no vertical swipes inside a full-screen reel viewer.
   function reelViewerOpen() {
+    if (document.getElementById('dmee-reel')) return true; // Dmee's own full-screen reel (Home feed)
     if (onStories()) return false; // stories keep Instagram's own taps and swipes
     var vids = document.querySelectorAll('video:not(.dmee-vid)');
     for (var i = 0; i < vids.length; i++) {
@@ -203,7 +204,7 @@
   }
 
   var touchStartX = 0, touchStartY = 0;
-  document.addEventListener('touchstart', function (e) {
+  window.addEventListener('touchstart', function (e) {
     if (e.touches.length) {
       touchStartX = e.touches[0].clientX;
       touchStartY = e.touches[0].clientY;
@@ -218,15 +219,37 @@
     return !!sc && (window.getComputedStyle(sc).scrollSnapType || '').indexOf('y') === -1;
   }
 
-  document.addEventListener('touchmove', function (e) {
-    if (!e.touches.length || !reelViewerOpen()) return;
-    if (insidePanel(e.target)) return;
-    var dx = e.touches[0].clientX - touchStartX;
-    var dy = e.touches[0].clientY - touchStartY;
-    if (Math.abs(dy) > Math.abs(dx)) {
-      e.preventDefault();
-      e.stopPropagation();
-    }
+  // No swipes at all in a full-screen reel: not up/down (other reels) and not left/right
+  // (Instagram's swipe-to-close drags the reel away). Close it with the back arrow instead.
+  // Dmee's own progress bar and speed button keep their touches.
+  function ownReelControl(el) {
+    return !!(el && el.closest && el.closest('#dmee-rbar, #dmee-reel'));
+  }
+  // A popup on top of the reel (comments, share list), not the reel's own screen.
+  function popupOverReel(el) {
+    var dlg = el && el.closest && el.closest('[role="dialog"]');
+    if (!dlg) return false;
+    var v = mainReelVideo();
+    return !(v && dlg.contains(v));
+  }
+  function blockReelSwipe(e, x, y) {
+    if (!reelViewerOpen() || ownReelControl(e.target)) return;
+    var dx = Math.abs(x - touchStartX), dy = Math.abs(y - touchStartY);
+    // Sideways: blocked everywhere except in a real popup (the reel sits inside the chat's
+    // scrolling list, so "inside something that scrolls" isn't enough to allow it).
+    // Up/down: still allowed inside comments and other panels that scroll.
+    if (dx > dy ? popupOverReel(e.target) : insidePanel(e.target)) return;
+    // From the very first move: once the browser starts scrolling sideways it can't be stopped.
+    if (e.cancelable) e.preventDefault();
+    if (Math.abs(x - touchStartX) < 6 && Math.abs(y - touchStartY) < 6) return; // a tap: Instagram still sees it
+    e.stopImmediatePropagation();
+  }
+  // On window, so this runs before any of Instagram's own swipe handlers.
+  window.addEventListener('touchmove', function (e) {
+    if (e.touches.length) blockReelSwipe(e, e.touches[0].clientX, e.touches[0].clientY);
+  }, { capture: true, passive: false });
+  window.addEventListener('pointermove', function (e) {
+    if (e.pointerType === 'touch') blockReelSwipe(e, e.clientX, e.clientY);
   }, { capture: true, passive: false });
 
   // ---- Swiping between Dmee tabs ----
@@ -496,26 +519,61 @@
       if (!DISCOVER_RE.test(node.nodeValue.trim())) continue;
       if (!node.parentElement || node.parentElement.closest('[data-dmee-discover]')) continue; // already hidden
       if (!isVisible(node.parentElement)) continue; // hidden copies (e.g. inside the profile header)
-      // Hide the smallest block that holds this title and its sideways-scrolling list of people.
-      for (var el = node.parentElement, d = 0; el && el !== document.body && d < 10; el = el.parentElement, d++) {
-        if (hasHorizontalScroller(el)) {
-          if (safeToHide(el)) {
-            el.style.setProperty('display', 'none', 'important');
-            el.setAttribute('data-dmee-discover', '1');
-          }
-          break;
-        }
+      // The smallest block holding this title AND a sideways list of people that comes after it.
+      var title = node.parentElement;
+      for (var el = title, d = 0; el && el !== document.body && d < 10; el = el.parentElement, d++) {
+        var sc = scrollerAfter(el, title);
+        if (!sc) continue;
+        if (safeToHide(el, 0.75)) { markDiscover(el); break; }
+        // Too big (it also holds the profile itself): hide only the title row and the list.
+        var titleRow = childContaining(el, title), listRow = childContaining(el, sc);
+        if (titleRow && titleRow !== listRow && safeToHide(titleRow, 0.2)) markDiscover(titleRow);
+        // (The list itself is full of profile pictures, so it gets its own, lighter check.)
+        if (listRow && listRow !== titleRow && safeListToHide(listRow)) markDiscover(listRow);
+        else if (safeListToHide(sc)) markDiscover(sc);
+        break;
       }
     }
   }
+  function safeListToHide(el) {
+    if (!el || el === document.body || el === document.documentElement || el.closest('header')) return false;
+    if (el.querySelector('header, main, a[href*="/accounts/edit"], a[href$="/followers/"], a[href$="/following/"]')) return false;
+    return el.getBoundingClientRect().height < window.innerHeight * 0.6;
+  }
+  function markDiscover(el) {
+    el.style.setProperty('display', 'none', 'important');
+    el.setAttribute('data-dmee-discover', '1');
+  }
+  // The direct child of [root] that contains [inner].
+  function childContaining(root, inner) {
+    for (var c = inner; c && c.parentElement; c = c.parentElement) if (c.parentElement === root) return c;
+    return null;
+  }
+  // A sideways-scrolling list inside [root] that comes after [title] in the page (not the
+  // story highlights above it).
+  function scrollerAfter(root, title) {
+    var all = root.querySelectorAll('*');
+    for (var i = 0; i < all.length && i < 600; i++) {
+      var e = all[i];
+      if (!(title.compareDocumentPosition(e) & Node.DOCUMENT_POSITION_FOLLOWING) || e.contains(title)) continue;
+      var ox = window.getComputedStyle(e).overflowX;
+      if ((ox === 'auto' || ox === 'scroll') && e.scrollWidth > e.clientWidth + 2) return e;
+    }
+    return null;
+  }
 
+  var PROFILE_STATS_RE = /\b(followers|following|edit profile|share profile|sledilci|uredi profil|follower|abonnenten|profil bearbeiten|seguidores|siguiendo|editar perfil|abonnés|abonnements|modifier le profil|pratitelji|seguaci|seguiti|modifica profilo|obserwujący|obserwowani|edytuj profil)\b/i;
   // Never hide the profile itself (photo, stats, bio, buttons) or a big part of the page.
-  function safeToHide(el) {
+  function safeToHide(el, maxFrac) {
     if (!el || el === document.body || el === document.documentElement) return false;
     if (el.querySelector('header, main, a[href$="/followers/"], a[href$="/following/"], img[alt*="profile picture"]')) return false;
     if (el.closest('header')) return false;
+    // Your own profile's top (photo, numbers, bio, "Edit profile"): Instagram doesn't always use
+    // <header> / follower links there, so also recognise it by its content.
+    if (el.querySelector('a[href*="/accounts/edit"], a[href*="/followers"], a[href*="/following"]')) return false;
+    if (PROFILE_STATS_RE.test(el.textContent || '')) return false;
     var r = el.getBoundingClientRect();
-    return r.height < window.innerHeight * 0.45;
+    return r.height < window.innerHeight * (maxFrac || 0.45);
   }
 
   function hasHorizontalScroller(root) {
@@ -902,7 +960,7 @@
   // ===== 2x button, just above the reel's like button =====
   function update2xButton() {
     var b = document.getElementById('dmee-2x');
-    var v = (!window.__dmeeHidden && reelViewerOpen()) ? mainReelVideo() : null;
+    var v = (!window.__dmeeHidden && reelViewerOpen() && !document.getElementById('dmee-reel')) ? mainReelVideo() : null;
     var like = v ? findLikeButton(true) : null;
     if (!v || !like) { if (b) b.style.display = 'none'; return; }
     if (!b) {
@@ -939,12 +997,107 @@
     b.style.border = on ? 'none' : '1.5px solid rgba(255,255,255,.85)';
   }
 
+  // ===== Progress bar on reels opened from a chat (Instagram's player has none) =====
+  // A thin line at the bottom of the video; drag it to jump (shows the time while dragging).
+  function updateReelBar() {
+    var bar = document.getElementById('dmee-rbar');
+    var v = (!window.__dmeeHidden && reelViewerOpen() && !document.getElementById('dmee-reel')) ? mainReelVideo() : null;
+    if (!v) { if (bar) bar.style.display = 'none'; return; }
+    if (!bar) {
+      bar = document.createElement('div');
+      bar.id = 'dmee-rbar';
+      bar.style.cssText = 'position:fixed;height:40px;padding-bottom:8px;box-sizing:border-box;z-index:2147483645;display:flex;align-items:flex-end;touch-action:none;-webkit-tap-highlight-color:transparent';
+      bar.innerHTML = '<div class="t" style="position:relative;width:100%;height:2px;background:rgba(255,255,255,.3);transition:height .15s">' +
+        '<div class="f" style="position:absolute;left:0;top:0;bottom:0;width:0;background:#fff"></div></div>' +
+        '<div class="tm" style="position:absolute;left:12px;right:12px;bottom:44px;display:none;justify-content:space-between;color:#fff;' +
+        'font:600 15px -apple-system,system-ui,Roboto,sans-serif;filter:drop-shadow(0 1px 2px rgba(0,0,0,.7))"><span class="c"></span><span class="d"></span></div>';
+      var fillEl = bar.querySelector('.f'), track = bar.querySelector('.t'), tm = bar.querySelector('.tm');
+      var drag = false, wasPlaying = false;
+      var seek = function (x) {
+        var cur = bar.__v; if (!cur || !cur.duration) return;
+        var r = bar.getBoundingClientRect();
+        var f = Math.max(0, Math.min(1, (x - r.left) / Math.max(1, r.width)));
+        cur.currentTime = f * cur.duration;
+        fillEl.style.width = (f * 100) + '%';
+        bar.querySelector('.c').textContent = fmtTime(f * cur.duration);
+      };
+      var start = function (e) {
+        lastBarTouch = Date.now();
+        var cur = bar.__v; if (!cur) return;
+        drag = true; wasPlaying = !cur.paused; cur.pause();
+        track.style.height = '6px'; tm.style.display = 'flex';
+        bar.querySelector('.d').textContent = fmtTime(cur.duration);
+        seek(e.touches[0].clientX);
+      };
+      var move = function (e) { if (drag && e.touches.length) seek(e.touches[0].clientX); };
+      var end = function () {
+        noKeyboard();
+        if (!drag) return;
+        drag = false; track.style.height = '2px'; tm.style.display = 'none';
+        if (wasPlaying && bar.__v) { var pr = bar.__v.play(); if (pr && pr.catch) pr.catch(function () {}); }
+      };
+      bar.__h = { touchstart: start, touchmove: move, touchend: end, touchcancel: end };
+      var tick = function () {
+        var cur = bar.__v;
+        if (!drag && cur && cur.duration && bar.style.display !== 'none') fillEl.style.width = (100 * cur.currentTime / cur.duration) + '%';
+        if (bar.isConnected) requestAnimationFrame(tick);
+      };
+      document.body.appendChild(bar);
+      requestAnimationFrame(tick);
+    }
+    bar.__v = v;
+    var r = v.getBoundingClientRect();
+    var bottom = Math.min(r.bottom, window.innerHeight);
+    bar.style.left = Math.round(Math.max(0, r.left)) + 'px';
+    bar.style.width = Math.round(Math.min(r.right, window.innerWidth) - Math.max(0, r.left)) + 'px';
+    bar.style.top = Math.round(bottom - 32) + 'px'; // 32 px over the video, 8 px under it
+    bar.style.display = 'flex';
+  }
+
+  // Dragging the bar must never open the keyboard ("Reply to…" sits just under it).
+  var lastBarTouch = 0;
+  function noKeyboard() {
+    lastBarTouch = Date.now();
+    var a = document.activeElement;
+    if (a && a !== document.body && (/^(INPUT|TEXTAREA)$/.test(a.tagName) || a.isContentEditable)) { try { a.blur(); } catch (err) {} }
+    var hide = function () { try { window.DmeeAndroid.hideKeyboard(); } catch (err) {} };
+    hide(); setTimeout(hide, 150); setTimeout(hide, 400);
+  }
+  // A long press on the reel's controls must not start Android's own long-press (it cancels the
+  // drag and can pop up the keyboard).
+  window.addEventListener('contextmenu', function (e) {
+    if (reelViewerOpen()) { e.preventDefault(); e.stopImmediatePropagation(); }
+  }, true);
+  window.addEventListener('focusin', function (e) {
+    var t = e.target;
+    if (!t || !/^(INPUT|TEXTAREA)$/.test(t.tagName) && !t.isContentEditable) return;
+    if (Date.now() - lastBarTouch < 1000 || (document.getElementById('dmee-rbar') || {}).__dragging) {
+      try { t.blur(); } catch (err) {}
+    }
+  }, true);
+  // The bar's touches are handled on window, before Instagram sees them: otherwise Instagram's
+  // own swipe-to-close also follows the finger while you drag the bar.
+  ['touchstart', 'touchmove', 'touchend', 'touchcancel', 'pointerdown', 'pointermove', 'pointerup',
+   'pointercancel', 'mousedown', 'mouseup', 'click'].forEach(function (type) {
+    window.addEventListener(type, function (e) {
+      var bar = e.target && e.target.closest && e.target.closest('#dmee-rbar');
+      if (!bar) return;
+      if (e.cancelable) e.preventDefault();
+      e.stopImmediatePropagation();
+      if (bar.__h && bar.__h[type]) bar.__h[type](e);
+    }, { capture: true, passive: false });
+  });
+
   // ===== Reel open: tell the app (it hides the menu) =====
   var lastReel = null;
   // While a reel is open, no text can be selected (a long press is "hold for 2x", not "copy text").
   var NOSELECT_CSS =
     'html[data-dmee-reel], html[data-dmee-reel] * { -webkit-user-select: none !important; user-select: none !important;' +
     ' -webkit-touch-callout: none !important; }' +
+    // No sideways dragging of the reel (Instagram's swipe-to-close).
+    'html[data-dmee-reel] body { overflow-x: hidden !important; overscroll-behavior: none !important; }' +
+    'html[data-dmee-reel] body, html[data-dmee-reel] body * { touch-action: pan-y !important; }' +
+    'html[data-dmee-reel] #dmee-rbar, html[data-dmee-reel] #dmee-rbar * { touch-action: none !important; }' +
     'html[data-dmee-reel] input, html[data-dmee-reel] textarea, html[data-dmee-reel] [contenteditable="true"] {' +
     ' -webkit-user-select: text !important; user-select: text !important; }';
   function setNoSelect(on) {
@@ -1098,6 +1251,7 @@
     return best;
   }
   window.__dmeeCloseReel = function () {
+    if (document.getElementById('dmee-reel')) { closeFeedReel(); return true; }
     if (!reelViewerOpen()) return false;
     var btn = topLeftBackButton();
     if (btn) {
@@ -1359,6 +1513,43 @@
     if (input) input.click();
     else if (parts && parts.photo) parts.photo.click();
   }
+  // Is the message bar really visible (not covered by Instagram's Details panel, off screen, ...)?
+  function barOnScreen(parts) {
+    var r = parts.row.getBoundingClientRect();
+    if (!r.width || r.bottom <= 0 || r.top >= window.innerHeight) return false;
+    var cam = document.getElementById('dmee-cam');
+    var x = Math.min(window.innerWidth - 2, Math.max(1, r.left + r.width * 0.6));
+    var y = Math.min(window.innerHeight - 1, Math.max(0, r.top + r.height / 2));
+    if (cam) cam.style.pointerEvents = 'none';
+    var hit = document.elementFromPoint(x, y);
+    if (cam) cam.style.pointerEvents = '';
+    return !!hit && (parts.pill.contains(hit) || hit.contains(parts.row));
+  }
+
+  // Back while Instagram's chat Details panel is open: close the panel (stay in the chat).
+  var BACK_RE = /^(back|nazaj|zurück|atrás|retour|natrag|indietro|wstecz|go back)$/i;
+  window.__dmeeCloseDetails = function () {
+    if (!onThread()) { dmeeLog('details: not thread ' + location.pathname); return false; }
+    var parts = composerParts();
+    if (parts && barOnScreen(parts)) { dmeeLog('details: bar visible'); return false; } // the chat itself is showing
+    // Instagram's own arrow at the top left of the panel (by its name, else by its place).
+    var svgs = document.querySelectorAll('svg'), byPlace = null;
+    for (var i = 0; i < svgs.length; i++) {
+      var r = svgs[i].getBoundingClientRect();
+      if (!r.width || r.top < 0 || r.top > 120 || r.left > 80) continue;
+      var label = (svgs[i].getAttribute('aria-label') || '').trim();
+      var b = svgs[i].closest('button, [role="button"], a') || svgs[i].parentElement;
+      // Only the arrow you can actually see (the chat's own arrow sits hidden under the panel).
+      var hit = document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2);
+      if (!hit || !(b.contains(hit) || hit.contains(svgs[i]))) continue;
+      if (BACK_RE.test(label)) { b.click(); dmeeLog('details: closed by label ' + label); return true; }
+      if (!byPlace) byPlace = b;
+    }
+    if (byPlace) { byPlace.click(); dmeeLog('details: closed by place'); return true; }
+    dmeeLog('details: no arrow found, svgs=' + svgs.length);
+    return false;
+  };
+
   function updateCameraButton() {
     var cam = document.getElementById('dmee-cam');
     var parts = (onThread() && !window.__dmeeHidden && !reelViewerOpen() && !onStories() &&
@@ -1409,6 +1600,8 @@
     // Right at the left end of the bar, like the Instagram app.
     var pr = parts.pill.getBoundingClientRect();
     var r = parts.row.getBoundingClientRect();
+    if (!barOnScreen(parts)) { cam.style.display = 'none'; return; }
+    cam.setAttribute('aria-label', feedText('camera', 'Camera'));
     cam.style.left = Math.round(pr.left + 7) + 'px';
     // A tall bar (photo preview, several lines): stay next to the last line.
     if (r.height > 64) r = { top: r.bottom - 52, height: 52 };
@@ -1534,13 +1727,29 @@
       box = document.createElement('div');
       box.id = 'dmee-feed';
       // Above everything of Instagram's page (taps must never reach the stories under it).
-      box.style.cssText = 'position:fixed;left:0;right:0;bottom:0;z-index:2147480000;overflow-y:auto;' +
-        '-webkit-overflow-scrolling:touch;background:#000;padding:4px 0 120px;box-sizing:border-box;' +
+      // Starts at the top of the screen with a see-through gap over the stories row: scrolling
+      // moves the stories away with the posts, like Instagram. The gap lets taps and sideways
+      // swipes through to the stories (pointer-events), only the posts take touches.
+      box.style.cssText = 'position:fixed;left:0;right:0;top:0;bottom:0;z-index:2147480000;overflow-y:auto;' +
+        '-webkit-overflow-scrolling:touch;background:transparent;pointer-events:none;padding:0 0 120px;box-sizing:border-box;' +
         'font-family:-apple-system,system-ui,Roboto,sans-serif;color:#fff;';
-      box.addEventListener('scroll', function () { reportAtTop(box); playFeedVideos(); }, { passive: true });
+      box.addEventListener('scroll', function () { moveTray(box); reportAtTop(box); playFeedVideos(); }, { passive: true });
       (document.body || document.documentElement).appendChild(box);
     }
     return box;
+  }
+  // The stories row goes up with the posts (and comes back when you scroll to the top).
+  function moveTray(box) {
+    var tray = box.__dmeeTray;
+    if (!tray || !tray.isConnected) return;
+    var y = Math.min(box.scrollTop, box.__dmeeTop || 0);
+    if (tray.__dmeeY === y) return;
+    tray.__dmeeY = y;
+    tray.style.setProperty('transform', y ? 'translateY(' + (-y) + 'px)' : 'none', 'important');
+  }
+  function resetTray(box) {
+    var tray = box && box.__dmeeTray;
+    if (tray) { tray.style.removeProperty('transform'); tray.__dmeeY = 0; }
   }
   // ---- One post, drawn like Instagram: header, swipeable photos, actions, likes, caption, comments ----
   var ICON = {
@@ -1570,9 +1779,10 @@
       media += '<div style="flex:0 0 100%;position:relative;scroll-snap-align:start;background:#111">' +
         (vs ? '<video class="dmee-vid" src="' + escapeHtml(vs) + '" poster="' + escapeHtml(slides[s].u) + '" muted playsinline loop ' +
           'preload="none" style="position:absolute;inset:0;width:100%;height:100%;object-fit:cover"></video>' +
-          '<div class="dmee-mute" style="position:absolute;right:10px;bottom:10px;width:26px;height:26px;border-radius:50%;' +
+          '<div data-act="sound" role="button" aria-label="' + escapeHtml(feedText('sound', 'Sound on or off')) + '" style="position:absolute;right:0;bottom:0;width:48px;height:48px;' +
+          'display:flex;align-items:center;justify-content:center"><div class="dmee-mute" style="width:26px;height:26px;border-radius:50%;' +
           'background:rgba(0,0,0,.6);display:flex;align-items:center;justify-content:center;pointer-events:none">' +
-          (feedMuted ? ICON.muted : ICON.sound) + '</div>' :
+          (feedMuted ? ICON.muted : ICON.sound) + '</div></div>' :
         '<img src="' + escapeHtml(slides[s].u) + '" loading="lazy" referrerpolicy="no-referrer" draggable="false" ' +
         'style="position:absolute;inset:0;width:100%;height:100%;object-fit:cover">' +
         (slides[s].v ? '<div style="position:absolute;top:12px;right:12px;font-size:16px;opacity:.9">&#9654;</div>' : '')) + '</div>';
@@ -1590,7 +1800,7 @@
       'display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;white-space:pre-line"><b>' +
       escapeHtml(p.user) + '</b> ' + escapeHtml(p.caption) + '</div>' : '';
     return '<div class="dmee-post" data-code="' + escapeHtml(p.code) + '" data-id="' + escapeHtml(p.id || '') +
-      '" data-liked="' + (p.liked ? 1 : 0) + '" data-saved="' + (p.saved ? 1 : 0) + '" data-likes="' + (+p.likes || 0) + '" style="margin-bottom:26px">' +
+      '" data-liked="' + (p.liked ? 1 : 0) + '" data-saved="' + (p.saved ? 1 : 0) + '" data-reposted="' + (p.reposted ? 1 : 0) + '" data-reposts="' + (+p.reposts || 0) + '" data-likes="' + (+p.likes || 0) + '" style="margin-bottom:26px">' +
       // header
       '<div style="display:flex;align-items:center;gap:10px;padding:8px 14px">' +
       '<a href="/' + escapeHtml(p.user) + '/" style="display:flex;align-items:center;gap:10px;color:#fff;text-decoration:none">' +
@@ -1607,12 +1817,12 @@
       (dots ? '<div style="position:relative;height:14px;pointer-events:none">' + dots.replace('top:12px', 'top:8px') + '</div>' : '') +
       // actions: like / comment / share ... save
       '<div style="display:flex;align-items:center;padding:' + (dots ? '0' : '8px') + ' 12px 0;gap:16px">' +
-      '<div data-act="like" style="display:flex;align-items:center;gap:6px"><span class="dmee-heart" style="display:flex">' + (p.liked ? ICON.heartOn : ICON.heart) +
+      '<div data-act="like" role="button" aria-label="' + escapeHtml(feedText('like', 'Like')) + '" style="display:flex;align-items:center;gap:6px"><span class="dmee-heart" style="display:flex">' + (p.liked ? ICON.heartOn : ICON.heart) +
       '</span><span class="dmee-likes" style="font-weight:600;font-size:14px">' + fmtCount(p.likes) + '</span></div>' +
-      '<div data-act="comment" style="display:flex;align-items:center;gap:6px">' + ICON.comment +
+      '<div data-act="comment" role="button" aria-label="' + escapeHtml(feedText('comment', 'Comment')) + '" style="display:flex;align-items:center;gap:6px">' + ICON.comment +
       '<span style="font-weight:600;font-size:14px">' + fmtCount(p.comments) + '</span></div>' +
-      '<div data-act="share">' + ICON.share + '</div>' +
-      '<div data-act="save" class="dmee-save" style="margin-left:auto">' + (p.saved ? ICON.saveOn : ICON.save) + '</div></div>' +
+      '<div data-act="share" role="button" aria-label="' + escapeHtml(feedText('share', 'Share')) + '">' + ICON.share + '</div>' +
+      '<div data-act="save" role="button" aria-label="' + escapeHtml(feedText('save', 'Save')) + '" class="dmee-save" style="margin-left:auto">' + (p.saved ? ICON.saveOn : ICON.save) + '</div></div>' +
       cap +
       (p.comments ? '<div data-act="comment" style="padding:6px 14px 0;font-size:14px;color:#8e8e93">' +
         escapeHtml(feedText('view_comments', 'View all %d comments').replace('%d', fmtCount(p.comments))) + '</div>' : '') +
@@ -1639,6 +1849,7 @@
     var post = document.querySelector('#dmee-feed .dmee-post[data-code="' + code + '"]');
     if (!post) return;
     if ((post.getAttribute('data-liked') === '1') !== liked) setLikeUi(post, liked);
+    syncFeedReel();
     dmeeLog('like ' + code + ' ok=' + ok + ' liked=' + liked);
   };
   // Save: like the heart, Dmee presses Instagram's own Save button on the (invisible) post page.
@@ -1654,6 +1865,7 @@
   window.__dmeeSaveResult = function (code, ok, saved) {
     var post = document.querySelector('#dmee-feed .dmee-post[data-code="' + code + '"]');
     if (post && (post.getAttribute('data-saved') === '1') !== saved) setSaveUi(post, saved);
+    syncFeedReel();
     dmeeLog('save ' + code + ' ok=' + ok + ' saved=' + saved);
   };
   // Videos: the one you're looking at plays (muted, like Instagram); tap it for sound.
@@ -1661,7 +1873,7 @@
     var box = document.getElementById('dmee-feed');
     var vids = box ? box.querySelectorAll('video.dmee-vid') : [];
     if (!vids.length) return;
-    var on = box.style.display !== 'none' && !window.__dmeeHidden, best = null, bestArea = 0;
+    var on = box.style.display !== 'none' && !window.__dmeeHidden && !document.getElementById('dmee-reel'), best = null, bestArea = 0;
     var vh = window.innerHeight, vw = window.innerWidth;
     for (var i = 0; i < vids.length; i++) {
       var r = vids[i].getBoundingClientRect();
@@ -1677,6 +1889,228 @@
         if (v.paused) { if (v.preload !== 'auto') v.preload = 'auto'; var pr = v.play(); if (pr && pr.catch) pr.catch(function () {}); }
       } else if (!v.paused) v.pause();
     }
+  }
+  // ---- Full-screen reel (tap a video in the feed), like Instagram's: just this one video,
+  // nothing to swipe to. Drawn by Dmee from the post we already have, so no Reels page loads.
+  var RICON = {
+    // Instagram's own reel icons: speaker, paper plane (Send), repost arrows.
+    soundOn: '<svg viewBox="0 0 24 24" width="22" height="22" fill="#fff"><path d="M4 9.2h3.2L12 5.1v13.8l-4.8-4.1H4z"/><path d="M15.6 8.7a4.6 4.6 0 0 1 0 6.6M18.1 6.2a8.1 8.1 0 0 1 0 11.6" fill="none" stroke="#fff" stroke-width="1.9" stroke-linecap="round"/></svg>',
+    soundOff: '<svg viewBox="0 0 24 24" width="22" height="22" fill="#fff"><path d="M4 9.2h3.2L12 5.1v13.8l-4.8-4.1H4z"/><path d="M15.5 9.5l5 5M20.5 9.5l-5 5" fill="none" stroke="#fff" stroke-width="1.9" stroke-linecap="round"/></svg>',
+    send: '<svg viewBox="0 0 24 24" width="30" height="30" fill="none" stroke="#fff" stroke-width="1.9" stroke-linejoin="round"><path d="M22 3 9.2 10.1M11.7 20.3 22 3H2l7.2 7.1z"/></svg>',
+    repost: '<svg viewBox="0 0 24 24" width="30" height="30" fill="none" stroke="#fff" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M17 2.5l3 3-3 3"/><path d="M4 11.5v-2a4 4 0 0 1 4-4h12"/><path d="M7 21.5l-3-3 3-3"/><path d="M20 12.5v2a4 4 0 0 1-4 4H4"/></svg>',
+    repostOn: '<svg viewBox="0 0 24 24" width="30" height="30" fill="none" stroke="#fff" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M17 2.5l3 3-3 3"/><path d="M4 11.5v-2a4 4 0 0 1 4-4h12"/><path d="M7 21.5l-3-3 3-3"/><path d="M20 12.5v2a4 4 0 0 1-4 4H4"/><path d="M9 12.2l2.1 2.1 4-4.2"/></svg>',
+    back: '<svg viewBox="0 0 24 24" width="26" height="26" fill="none" stroke="#fff" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 4l-8 8 8 8"/></svg>'
+  };
+  function feedItem(code) {
+    var items = feedState.items || [];
+    for (var i = 0; i < items.length; i++) if (items[i].code === code) return items[i];
+    return null;
+  }
+  function bigIcon(svg) { return svg.replace(/width="2\d" height="2\d"/, 'width="30" height="30"'); }
+  function syncFeedReel() {
+    var ov = document.getElementById('dmee-reel'); if (!ov) return;
+    var post = document.querySelector('#dmee-feed .dmee-post[data-code="' + ov.getAttribute('data-code') + '"]');
+    if (!post) return;
+    var liked = post.getAttribute('data-liked') === '1', saved = post.getAttribute('data-saved') === '1';
+    ov.querySelector('.dmee-r-heart').innerHTML = bigIcon(liked ? ICON.heartOn : ICON.heart);
+    ov.querySelector('.dmee-r-likes').textContent = fmtCount(post.getAttribute('data-likes'));
+    ov.querySelector('.dmee-r-save').innerHTML = bigIcon(saved ? ICON.saveOn : ICON.save);
+    var rp = post.getAttribute('data-reposted') === '1';
+    ov.querySelector('.dmee-r-repost').innerHTML = rp ? RICON.repostOn : RICON.repost;
+    var rc = +post.getAttribute('data-reposts') || 0;
+    // No number: Instagram's website doesn't tell Dmee the real repost count.
+    ov.querySelector('.dmee-r-reposts').textContent = '';
+  }
+  function toggleRepost(post) {
+    var want = post.getAttribute('data-reposted') !== '1';
+    post.__dmeeRepostedHere = want;
+    setRepostUi(post, want);
+    try { window.DmeeAndroid.repostPost(post.getAttribute('data-code'), want); } catch (err) { setRepostUi(post, !want); }
+  }
+  function setRepostUi(post, on) {
+    var was = post.getAttribute('data-reposted') === '1';
+    post.setAttribute('data-reposted', on ? 1 : 0);
+    if (was !== on) post.setAttribute('data-reposts', Math.max(0, (+post.getAttribute('data-reposts') || 0) + (on ? 1 : -1)));
+    syncFeedReel();
+  }
+  // The repost count, read from the post's page (Instagram's feed data doesn't include it).
+  window.__dmeeRepostCount = function (code, txt) {
+    var post = document.querySelector('#dmee-feed .dmee-post[data-code="' + code + '"]');
+    var m = /^([\d.,]+)\s*([KkMm]?)$/.exec(String(txt || '').trim());
+    if (!post || !m) return;
+    var n = m[2] ? parseFloat(m[1].replace(',', '.')) * (/k/i.test(m[2]) ? 1e3 : 1e6) : +m[1].replace(/[.,]/g, '');
+    if (!isFinite(n)) return;
+    post.setAttribute('data-reposts', Math.round(n) + (post.getAttribute('data-reposted') === '1' && post.__dmeeRepostedHere ? 1 : 0));
+    syncFeedReel();
+  };
+  window.__dmeeRepostResult = function (code, ok, on) {
+    var post = document.querySelector('#dmee-feed .dmee-post[data-code="' + code + '"]');
+    if (post && (post.getAttribute('data-reposted') === '1') !== on) setRepostUi(post, on);
+    dmeeLog('repost ' + code + ' ok=' + ok + ' on=' + on);
+  };
+  function closeFeedReel() {
+    var ov = document.getElementById('dmee-reel'); if (!ov) return;
+    var v = ov.querySelector('video'); if (v) { try { v.pause(); v.removeAttribute('src'); v.load(); } catch (err) {} }
+    ov.parentNode.removeChild(ov);
+    reportReel();
+    playFeedVideos();
+  }
+  function fmtTime(t) {
+    t = Math.max(0, Math.floor(t || 0));
+    return Math.floor(t / 60) + ':' + ('0' + (t % 60)).slice(-2);
+  }
+  // Laid out like a reel a friend sends you in a chat: name + time on top, sound button top
+  // right, like / comment / share on the right, caption at the bottom, a thin progress bar
+  // you can drag (shows the time while dragging, like Instagram).
+  function openFeedReel(code, slideIdx) {
+    var p = feedItem(code);
+    var post = document.querySelector('#dmee-feed .dmee-post[data-code="' + code + '"]');
+    if (!p || !post) return;
+    var slides = (p.slides && p.slides.length) ? p.slides : [{ u: p.img, m: '' }];
+    var sl = slides[slideIdx] || slides[0];
+    if (!sl || !sl.m) return;
+    closeFeedReel();
+    var fv = document.querySelectorAll('#dmee-feed video.dmee-vid');
+    for (var i = 0; i < fv.length; i++) if (!fv[i].paused) fv[i].pause();
+    var tall = (p.h / Math.max(1, p.w)) >= 1.5;
+    var shadow = 'filter:drop-shadow(0 1px 2px rgba(0,0,0,.6));';
+    var act = 'display:flex;flex-direction:column;align-items:center;gap:4px;font:600 13px -apple-system,system-ui,Roboto,sans-serif;color:#fff;' + shadow;
+    var round = 'width:44px;height:44px;border-radius:50%;background:rgba(120,120,120,.55);display:flex;align-items:center;justify-content:center;';
+    var ov = document.createElement('div');
+    ov.id = 'dmee-reel';
+    ov.setAttribute('data-code', code);
+    ov.style.cssText = 'position:fixed;inset:0;z-index:2147482500;background:#000;color:#fff;touch-action:none;' +
+      'font-family:-apple-system,system-ui,Roboto,sans-serif;-webkit-tap-highlight-color:transparent;overscroll-behavior:none;user-select:none;-webkit-user-select:none;-webkit-touch-callout:none;';
+    ov.innerHTML =
+      '<div class="dmee-r-stage" style="position:absolute;left:0;right:0;top:0;bottom:64px;overflow:hidden">' +
+        '<video class="dmee-vid dmee-rv" src="' + escapeHtml(sl.m) + '" poster="' + escapeHtml(sl.u || '') + '" playsinline loop autoplay ' +
+        'style="position:absolute;inset:0;width:100%;height:100%;object-fit:' + (tall ? 'cover' : 'contain') + ';background:#000"></video>' +
+        '<div style="position:absolute;left:0;right:0;top:0;height:22%;background:linear-gradient(rgba(0,0,0,.45),transparent);pointer-events:none"></div>' +
+        '<div style="position:absolute;left:0;right:0;bottom:0;height:40%;background:linear-gradient(transparent,rgba(0,0,0,.55));pointer-events:none"></div>' +
+        '<div class="dmee-r-play" style="position:absolute;left:50%;top:50%;width:84px;height:84px;margin:-42px 0 0 -42px;border-radius:50%;' +
+          'background:rgba(0,0,0,.45);display:none;align-items:center;justify-content:center;pointer-events:none">' +
+          '<svg viewBox="0 0 24 24" width="40" height="40" fill="#fff"><path d="M8 5.5v13l11-6.5z"/></svg></div>' +
+        '<div class="dmee-bigheart" style="position:absolute;left:50%;top:50%;transform:translate(-50%,-50%) scale(0);opacity:0;' +
+          'transition:transform .25s cubic-bezier(.2,1.6,.4,1),opacity .25s;pointer-events:none">' +
+          ICON.heartOn.replace('width="26" height="26"', 'width="110" height="110"') + '</div>' +
+        '<div class="dmee-r-times" style="position:absolute;left:16px;right:16px;bottom:22px;display:none;justify-content:space-between;' +
+          'font:600 15px -apple-system,system-ui,Roboto,sans-serif;' + shadow + '"><span class="dmee-r-cur">0:00</span><span class="dmee-r-dur">0:00</span></div>' +
+      '</div>' +
+      '<div class="dmee-r-ui">' +
+      // top: back, who posted it and when, sound
+      '<div style="position:absolute;left:0;right:0;top:0;height:64px;display:flex;align-items:center;padding:0 12px 0 4px;gap:8px;' + shadow + '">' +
+        '<div data-r="back" role="button" aria-label="' + escapeHtml(feedText('back', 'Back')) + '" style="width:44px;height:48px;display:flex;align-items:center;justify-content:center">' + RICON.back + '</div>' +
+        '<a href="/' + escapeHtml(p.user) + '/" data-r="user" style="display:flex;align-items:center;gap:10px;color:#fff;text-decoration:none;min-width:0;flex:1">' +
+          '<img src="' + escapeHtml(p.pic) + '" referrerpolicy="no-referrer" style="width:36px;height:36px;border-radius:50%;object-fit:cover;background:#222;flex:none">' +
+          '<span style="display:flex;flex-direction:column;min-width:0;line-height:1.25"><span style="font-weight:600;font-size:15px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' +
+          escapeHtml(p.user) + '</span><span style="font-size:13px;opacity:.85">' + timeAgo(p.t) + '</span></span></a>' +
+        '<div data-r="sound" role="button" aria-label="' + escapeHtml(feedText('sound', 'Sound on or off')) + '" class="dmee-r-sound" style="' + round + 'flex:none"></div>' +
+      '</div>' +
+      // right: like / comment / share / save
+      '<div style="position:absolute;right:8px;bottom:84px;display:flex;flex-direction:column;align-items:center;gap:18px">' +
+        '<div data-r="speed" role="button" class="dmee-r-speed" style="width:44px;height:44px;border-radius:22px;display:flex;align-items:center;' +
+          'justify-content:center;font:700 15px -apple-system,Roboto,sans-serif;color:#fff"></div>' +
+        '<div data-r="like" role="button" aria-label="' + escapeHtml(feedText('like', 'Like')) + '" style="' + act + '"><span class="dmee-r-heart" style="display:flex"></span><span class="dmee-r-likes"></span></div>' +
+        '<div data-r="comment" role="button" aria-label="' + escapeHtml(feedText('comment', 'Comment')) + '" style="' + act + '">' + bigIcon(ICON.comment) + '<span>' + fmtCount(p.comments) + '</span></div>' +
+        '<div data-r="repost" role="button" aria-label="' + escapeHtml(feedText('repost', 'Repost')) + '" style="' + act + '"><span class="dmee-r-repost" style="display:flex"></span><span class="dmee-r-reposts"></span></div>' +
+        '<div data-r="share" role="button" aria-label="' + escapeHtml(feedText('share', 'Share')) + '" style="' + act + '">' + RICON.send + '</div>' +
+        '<div data-r="save" role="button" aria-label="' + escapeHtml(feedText('save', 'Save')) + '" class="dmee-r-save" style="' + act + '"></div>' +
+      '</div>' +
+      // bottom: caption (tap for more)
+      (p.caption ? '<div data-r="cap" style="position:absolute;left:16px;right:72px;bottom:84px;font-size:14px;line-height:1.4;display:-webkit-box;' +
+        '-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;white-space:pre-line;' + shadow + '"><b>' + escapeHtml(p.user) + '</b> ' +
+        escapeHtml(p.caption) + '</div>' : '') +
+      '</div>' +
+      // progress bar (drag to jump)
+      '<div class="dmee-r-bar" style="position:absolute;left:0;right:0;bottom:52px;height:24px;display:flex;align-items:center">' +
+        '<div class="dmee-r-track" style="position:relative;width:100%;height:2px;background:rgba(255,255,255,.3);transition:height .15s">' +
+        '<div class="dmee-r-fill" style="position:absolute;left:0;top:0;bottom:0;width:0;background:#fff"></div></div></div>' +
+      '<div data-r="comment" role="button" style="position:absolute;left:12px;right:12px;bottom:8px;height:40px;border-radius:20px;background:#1c1c1e;' +
+        'display:flex;align-items:center;padding:0 16px;color:#8e8e93;font-size:14px">' + escapeHtml(feedText('add_comment', 'Add a comment…')) + '</div>';
+    (document.body || document.documentElement).appendChild(ov);
+    syncFeedReel();
+    var v = ov.querySelector('video');
+    var soundBtn = ov.querySelector('.dmee-r-sound'), playIcon = ov.querySelector('.dmee-r-play');
+    function showSound() { soundBtn.innerHTML = v.muted ? RICON.soundOff : RICON.soundOn; }
+    var speedBtn = ov.querySelector('.dmee-r-speed');
+    function showSpeed() { paint2x(speedBtn, v); }
+    function play() { var pr = v.play(); if (pr && pr.catch) pr.catch(function () { if (!v.muted) { v.muted = true; showSound(); play(); } }); }
+    v.muted = false;
+    showSound();
+    showSpeed();
+    play();
+    v.addEventListener('pause', function () { playIcon.style.display = 'flex'; });
+    v.addEventListener('play', function () { playIcon.style.display = 'none'; });
+    // Progress bar follows the video.
+    var fill = ov.querySelector('.dmee-r-fill'), track = ov.querySelector('.dmee-r-track'), bar = ov.querySelector('.dmee-r-bar');
+    var ui = ov.querySelector('.dmee-r-ui'), times = ov.querySelector('.dmee-r-times');
+    var dragging = false, wasPlaying = false;
+    function drawBar() { if (v.duration) fill.style.width = (100 * v.currentTime / v.duration) + '%'; }
+    v.addEventListener('timeupdate', function () { if (!dragging) drawBar(); });
+    (function tick() { if (!ov.isConnected) return; if (!dragging && !v.paused) drawBar(); requestAnimationFrame(tick); })();
+    function seekTo(x) {
+      if (!v.duration) return;
+      var f = Math.max(0, Math.min(1, x / Math.max(1, bar.clientWidth)));
+      v.currentTime = f * v.duration;
+      fill.style.width = (f * 100) + '%';
+      ov.querySelector('.dmee-r-cur').textContent = fmtTime(f * v.duration);
+    }
+    bar.addEventListener('touchstart', function (e) {
+      e.preventDefault(); e.stopPropagation();
+      dragging = true; wasPlaying = !v.paused; v.pause();
+      track.style.height = '6px'; ui.style.visibility = 'hidden'; times.style.display = 'flex';
+      ov.querySelector('.dmee-r-dur').textContent = fmtTime(v.duration);
+      seekTo(e.touches[0].clientX);
+    }, { passive: false });
+    bar.addEventListener('touchmove', function (e) { e.preventDefault(); e.stopPropagation(); if (dragging) seekTo(e.touches[0].clientX); }, { passive: false });
+    function endDrag(e) {
+      noKeyboard();
+      if (!dragging) return;
+      if (e) { if (e.cancelable) e.preventDefault(); e.stopPropagation(); }
+      dragging = false;
+      track.style.height = '2px'; ui.style.visibility = ''; times.style.display = 'none';
+      if (wasPlaying) play();
+    }
+    bar.addEventListener('touchend', endDrag, { passive: false });
+    bar.addEventListener('touchcancel', endDrag, { passive: false });
+    // Nothing behind it moves: no up/down swiping to other reels.
+    ov.addEventListener('touchmove', function (e) { e.preventDefault(); }, { passive: false });
+    var lastTap = 0, tapT = 0;
+    ov.addEventListener('click', function (e) {
+      if (e.target.closest('.dmee-r-bar')) { e.preventDefault(); e.stopPropagation(); return; }
+      var r = e.target.closest('[data-r]');
+      var what = r ? r.getAttribute('data-r') : (e.target.closest('.dmee-r-stage') ? 'video' : '');
+      if (what === 'user') { closeFeedReel(); return; } // the link opens their profile
+      e.preventDefault(); e.stopPropagation();
+      if (what === 'back') closeFeedReel();
+      else if (what === 'sound') { v.muted = !v.muted; showSound(); }
+      else if (what === 'speed') { v.playbackRate = v.playbackRate > 1 ? 1 : 2; if (v.paused) play(); showSpeed(); }
+      else if (what === 'repost') toggleRepost(post);
+      else if (what === 'like') { toggleLike(post, false); syncFeedReel(); }
+      else if (what === 'save') { toggleSave(post); syncFeedReel(); }
+      else if (what === 'comment' || what === 'share') {
+        v.pause();
+        try { window.DmeeAndroid.openPostSheet(code, what); } catch (err) {}
+      }
+      else if (what === 'cap') { r.style.webkitLineClamp = '8'; r.style.overflowY = 'auto'; r.style.maxHeight = '40vh'; }
+      else if (what === 'video') {
+        var now = Date.now();
+        clearTimeout(tapT);
+        if (now - lastTap < 320) {
+          lastTap = 0;
+          var h = ov.querySelector('.dmee-bigheart');
+          h.style.opacity = '1'; h.style.transform = 'translate(-50%,-50%) scale(1)';
+          setTimeout(function () { h.style.opacity = '0'; h.style.transform = 'translate(-50%,-50%) scale(0)'; }, 700);
+          toggleLike(post, true); syncFeedReel();
+        } else {
+          lastTap = now;
+          // One tap: pause / play (like a reel sent in a chat).
+          tapT = setTimeout(function () { if (v.paused) play(); else v.pause(); }, 300);
+        }
+      }
+    }, true);
+    dmeeLog('feed: reel open ' + code);
+    reportReel();
   }
   function toggleFeedSound() {
     feedMuted = !feedMuted;
@@ -1704,6 +2138,7 @@
       catch (err) { location.href = '/p/' + post.getAttribute('data-code') + '/'; }
     }
     else if (a === 'save') toggleSave(post);
+    else if (a === 'sound') toggleFeedSound();
     else if (a === 'more') { act.style.webkitLineClamp = 'unset'; act.style.display = 'block'; }
     else if (a === 'media') {
       // Double-tap the photo to like (single tap does nothing, like Instagram).
@@ -1712,9 +2147,14 @@
       if (now - lastMediaTap < 320) { bigHeart(post); toggleLike(post, true); lastMediaTap = 0; }
       else {
         lastMediaTap = now;
-        // Single tap on a video: sound on/off (after waiting to see it's not a double tap).
+        // Single tap on a video: open it full screen, like Instagram (after waiting to see it's not
+        // a double tap). Only that one reel: Dmee removes the "Suggested" reels and up/down swipes.
         var slide = e.target.closest('.dmee-media > div');
-        if (slide && slide.querySelector('video.dmee-vid')) window.__dmeeTapT = setTimeout(toggleFeedSound, 330);
+        if (slide && slide.querySelector('video.dmee-vid')) {
+          var code = post.getAttribute('data-code');
+          var idx = Array.prototype.indexOf.call(slide.parentNode.children, slide);
+          window.__dmeeTapT = setTimeout(function () { openFeedReel(code, idx); }, 330);
+        }
       }
     }
   }, true);
@@ -1745,13 +2185,28 @@
           '<div class="dmee-sk" style="width:100%;aspect-ratio:1/1"></div>';
       }
     } else {
+      var upd = 0;
+      try { upd = +window.DmeeAndroid.feedUpdatedAt() || 0; } catch (err) {}
+      if (upd && items.length) {
+        var mins = Math.max(0, Math.round((Date.now() - upd) / 60000));
+        var label = mins < 1 ? feedText('updated_now', 'Updated just now') :
+          mins < 60 ? feedText('updated_min', 'Updated %d min ago').replace('%d', mins) :
+          feedText('updated_h', 'Updated %d h ago').replace('%d', Math.round(mins / 60));
+        html += '<div style="padding:2px 14px 10px;font-size:12px;color:#8e8e93">' + escapeHtml(label) + '</div>';
+      }
       for (var i = 0; i < items.length; i++) html += postCard(items[i]);
       html += '<div style="padding:28px 20px;text-align:center;color:#8e8e93;font-size:14px">' +
         (items.length ? '&#10003; ' + escapeHtml(feedText('caught_up', "You're all caught up")) :
           feedState.paused ? escapeHtml(feedText('paused', 'Instagram needs a short break. Posts load again in a few minutes.')) :
           escapeHtml(feedText('no_posts', 'No new posts in the last 3 weeks'))) + '</div>';
     }
-    box.innerHTML = html;
+    box.innerHTML = '<div class="dmee-gap" style="height:' + Math.round(box.__dmeeTop || 0) + 'px;pointer-events:none"></div>' +
+      '<div class="dmee-in" style="background:#000;pointer-events:auto;padding-top:4px;min-height:100%">' + html + '</div>';
+    if (items.length) {
+      var pos = null;
+      try { pos = sessionStorage.getItem('dmee-feed-pos'); sessionStorage.removeItem('dmee-feed-pos'); } catch (err) {}
+      if (pos) { box.scrollTop = +pos || 0; moveTray(box); }
+    }
     setTimeout(playFeedVideos, 50);
   }
   // Dmee loads the posts itself (invisible profile pages, gentle on Instagram) and hands them over.
@@ -1782,20 +2237,28 @@
       if (why !== lastFeedWhy) { lastFeedWhy = why; dmeeLog('feed state ' + why); }
     }
     if (!accounts || !document.documentElement.hasAttribute('data-dmee-stories')) {
-      if (box) box.style.display = 'none';
+      if (box) { box.style.display = 'none'; resetTray(box); }
+      closeFeedReel();
       document.documentElement.removeAttribute('data-dmee-feedon');
       return;
     }
     var tray = findStoryTray();
-    var top = tray ? Math.max(0, tray.getBoundingClientRect().bottom + 6) : 140;
     box = feedBox();
+    if (tray !== box.__dmeeTray) { resetTray(box); box.__dmeeTray = tray; }
+    // Where the row ends when not moved up (its own move taken out).
+    var top = tray ? Math.max(0, tray.getBoundingClientRect().bottom + (tray.__dmeeY || 0) + 6) : 140;
     // The page behind the feed must not scroll (it made the stories row jump).
     if (!document.documentElement.hasAttribute('data-dmee-feedon')) {
       document.documentElement.setAttribute('data-dmee-feedon', '1');
       window.scrollTo(0, 0);
     }
-    if (!box.__dmeeTop || Math.abs(box.__dmeeTop - top) > 4) { box.__dmeeTop = top; box.style.top = Math.round(top) + 'px'; }
+    if (!box.__dmeeTop || Math.abs(box.__dmeeTop - top) > 4) {
+      box.__dmeeTop = top;
+      var gap = box.querySelector('.dmee-gap');
+      if (gap) gap.style.height = Math.round(top) + 'px';
+    }
     box.style.display = 'block';
+    moveTray(box);
     if (!document.getElementById('dmee-feed-style')) {
       var st = document.createElement('style');
       st.id = 'dmee-feed-style';
@@ -1833,7 +2296,8 @@
       b.setAttribute('role', 'button');
       b.style.cssText = 'position:fixed;left:50%;transform:translateX(-50%);bottom:104px;z-index:2147483000;' +
         'padding:11px 20px;border-radius:999px;font:600 15px -apple-system,system-ui,Roboto,sans-serif;' +
-        'box-shadow:0 6px 20px rgba(0,0,0,.45);-webkit-tap-highlight-color:transparent;white-space:nowrap;';
+        'box-shadow:0 6px 20px rgba(0,0,0,.45);-webkit-tap-highlight-color:transparent;white-space:nowrap;' +
+        'transition:opacity .2s, transform .2s;';
       b.addEventListener('click', function (e) {
         e.preventDefault(); e.stopPropagation();
         var u = b.getAttribute('data-user');
@@ -1854,19 +2318,32 @@
       b.style.border = inFeed ? '1px solid rgba(255,255,255,0.18)' : '1px solid transparent';
     }
     b.style.display = 'block';
+    b.style.opacity = addTucked ? '0' : '1';
+    b.style.pointerEvents = addTucked ? 'none' : 'auto';
+    b.style.transform = 'translateX(-50%)' + (addTucked ? ' translateY(24px)' : '');
   }
+  var addTucked = false, lastScrollY = 0;
+  window.addEventListener('scroll', function () {
+    var y = window.scrollY || 0;
+    if (y < 80 || y < lastScrollY - 6) addTucked = false;
+    else if (y > lastScrollY + 6) addTucked = true;
+    lastScrollY = y;
+    var b = document.getElementById('dmee-addfeed');
+    if (b && b.style.display !== 'none') updateAddButton();
+  }, { passive: true });
 
   // ===== Reel: shimmer skeleton until the video really plays =====
   function updateReelSkeleton() {
     var sk = document.getElementById('dmee-reel-sk');
     var v = (!window.__dmeeHidden && reelViewerOpen()) ? mainReelVideo() : null;
-    var waiting = v && !(v.readyState >= 3 && v.currentTime > 0.05);
+    var waiting = v && !v.__dmeePlayed && !(v.readyState >= 3 && v.currentTime > 0.05);
     if (v && !v.__dmeeSkWatch) {
       v.__dmeeSkWatch = true;
       v.__dmeeSkSince = Date.now();
-      v.addEventListener('playing', function () { setTimeout(updateReelSkeleton, 30); });
+      v.addEventListener('playing', function () { v.__dmeePlayed = true; setTimeout(updateReelSkeleton, 30); });
       v.addEventListener('timeupdate', function () { if (document.getElementById('dmee-reel-sk')) updateReelSkeleton(); });
     }
+    if (waiting && v.readyState >= 3 && v.currentTime > 0.05) v.__dmeePlayed = true;
     if (waiting && Date.now() - (v.__dmeeSkSince || 0) > 8000) waiting = false; // never forever
     if (!waiting) { if (sk) sk.style.display = 'none'; return; }
     if (!sk) {
@@ -1957,6 +2434,7 @@
     addFeedbackStyle();
     unmuteReel();
     update2xButton();
+    updateReelBar();
     reportSearching();
     reportReel();
     fixSqueezedNames();
@@ -2019,6 +2497,7 @@
     updateVanishBanner();
     unmuteReel();
     update2xButton();
+    updateReelBar();
     reportReel();
     fixSqueezedNames();
     hideStoryPlaceholder();
