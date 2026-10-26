@@ -1,4 +1,4 @@
-// dmee-rules-version: 48
+// dmee-rules-version: 57
 // Injected into instagram.com. Hides every way into the Feed, Reels tab and Explore.
 // Instagram's class names change often, so we target link destinations instead.
 (function () {
@@ -101,7 +101,16 @@
   // doesn't change). We remove those Suggested items, so there is nothing to swipe to.
   var SUGGESTED_RE = /^(Suggested|Suggested for you|Predlagano|Predlagano za vas)$/;
 
+  // Short memo: several parts ask this in the same pass (reading styles is slow).
+  var snapMemo = null, snapMemoAt = 0;
   function snapContainersWithVideo() {
+    var now = Date.now();
+    if (snapMemo && now - snapMemoAt < 120 && snapMemo.path === location.pathname) return snapMemo.list;
+    var list = snapContainersWithVideoNow();
+    snapMemo = { list: list, path: location.pathname }; snapMemoAt = now;
+    return list;
+  }
+  function snapContainersWithVideoNow() {
     var found = [];
     var vids = document.querySelectorAll('video:not(.dmee-vid)');
     for (var i = 0; i < vids.length; i++) {
@@ -190,8 +199,15 @@
   }
 
   // Extra safety: no vertical swipes inside a full-screen reel viewer.
+  var reelMemo = false, reelMemoAt = 0, reelMemoPath = '';
   function reelViewerOpen() {
     if (document.getElementById('dmee-reel')) return true; // Dmee's own full-screen reel (Home feed)
+    var now = Date.now();
+    if (now - reelMemoAt < 120 && reelMemoPath === location.pathname) return reelMemo;
+    reelMemoAt = now; reelMemoPath = location.pathname;
+    return (reelMemo = reelViewerOpenNow());
+  }
+  function reelViewerOpenNow() {
     if (onStories()) return false; // stories keep Instagram's own taps and swipes
     var vids = document.querySelectorAll('video:not(.dmee-vid)');
     for (var i = 0; i < vids.length; i++) {
@@ -589,7 +605,11 @@
   var APP_PROMO_RE = /^(Use the app|Open app|Open Instagram|Get the app|Share your first photo|Uporabi aplikacijo|Odpri aplikacijo|Delite svojo prvo fotografijo)$/;
   var promoHint = /Use the app|Open app|Open Instagram|Get the app|Share your first photo|aplikacijo|prvo fotografijo/;
 
+  var promoAt = 0, promoPath = '';
   function hideAppPromos() {
+    // Reading the whole page's text is slow: at most every 1.5 s (right away on a new page).
+    if (Date.now() - promoAt < 1500 && promoPath === location.pathname) return;
+    promoAt = Date.now(); promoPath = location.pathname;
     var body = document.body;
     if (!body || !promoHint.test(body.textContent || '')) return; // cheap check first
     var walker = document.createTreeWalker(body, NodeFilter.SHOW_TEXT);
@@ -622,12 +642,10 @@
   // Hide it so you just see the story's own background with the small loading spinner.
   function hideStoryPlaceholder() {
     if (!onStories()) return;
-    var icons = document.querySelectorAll('svg[aria-label="Play"], svg[aria-label="Predvajaj"]');
-    for (var i = 0; i < icons.length; i++) {
-      if (icons[i].getBoundingClientRect().width > window.innerWidth * 0.3) {
-        icons[i].style.setProperty('visibility', 'hidden', 'important');
-      }
-    }
+    // Instagram's big Play icon is hidden; Dmee's black loading cover (updateStoryCover) says
+    // "Tap to play" if a story needs a tap to start.
+    var icon = storyPlayIcon();
+    if (icon && icon.tagName.toLowerCase() !== 'video') icon.style.setProperty('visibility', 'hidden', 'important');
   }
 
   // ---- Stories tab: Instagram's home page with ONLY the stories row ----
@@ -1087,6 +1105,266 @@
       if (bar.__h && bar.__h[type]) bar.__h[type](e);
     }, { capture: true, passive: false });
   });
+
+  // ===== Notifications: open the chat that was tapped, clear a chat's notifications when it opens =====
+  var inboxReadySent = '', openChatTimer = 0, lastChatKey = '';
+  function reportInboxReady() {
+    if (!/^\/direct\/inbox\/?$/.test(location.pathname) || window.__dmeeHidden) { inboxReadySent = ''; return; }
+    if (inboxReadySent === location.href) return;
+    // The list has rows (links to chats) on screen.
+    if (!document.querySelector('a[href^="/direct/t/"], div[role="button"] img')) return;
+    inboxReadySent = location.href;
+    if (!window.__dmeeInboxTimed) { window.__dmeeInboxTimed = 1; dmeeLog('speed: inbox shown ' + Math.round(performance.now()) + ' ms after page start'); }
+    try { window.DmeeAndroid.inboxReady(); } catch (err) {}
+  }
+  // A chat in the inbox list, by its name exactly as Instagram shows it.
+  window.__dmeeOpenChat = function (name) {
+    function norm(t) { return String(t || '').toLowerCase().replace(/[^\p{L}\p{N}._]+/gu, ''); }
+    var want = norm(name), tries = 0;
+    if (!want) return;
+    clearTimeout(openChatTimer);
+    (function look() {
+      if (!/^\/direct\/inbox\/?$/.test(location.pathname)) { if (++tries < 80) openChatTimer = setTimeout(look, 250); return; }
+      var nodes = document.querySelectorAll('span, div, img[alt]');
+      for (var i = 0; i < nodes.length; i++) {
+        var el = nodes[i];
+        var txt = el.tagName === 'IMG' ? (el.getAttribute('alt') || '').replace(/'s profile picture.*$/i, '') : (el.children.length ? '' : el.textContent);
+        if (!txt || norm(txt) !== want) continue;
+        var r = el.getBoundingClientRect();
+        if (!r.width || r.top < 150) continue; // not the header / notes row
+        var row = el.closest('a[href^="/direct/t/"], [role="button"], [role="link"], [tabindex="0"]') || el;
+        dmeeLog('[NOTIF] found chat in inbox, opening');
+        row.click();
+        return;
+      }
+      // Not in the first rows yet: scroll the list down a bit and look again.
+      if (tries % 8 === 7) { var sc = document.scrollingElement; if (sc) sc.scrollTop += window.innerHeight * 0.6; }
+      if (++tries < 80) openChatTimer = setTimeout(look, 250);
+      else {
+        // Not found: list the names shown in the inbox, to see why.
+        var seen = [], rows = document.querySelectorAll('a[href^="/direct/t/"], [role="listitem"], [role="button"]');
+        for (var q = 0; q < rows.length && seen.length < 8; q++) {
+          var t = (rows[q].innerText || '').split('\n')[0].trim();
+          if (t && seen.indexOf(t) < 0) seen.push(t);
+        }
+        dmeeLog('[NOTIF] chat not found for "' + name + '", inbox shows: ' + seen.join(' | '));
+      }
+    })();
+  };
+  function reportOpenChat() {
+    if (!onThread() || window.__dmeeHidden) { lastChatKey = ''; return; }
+    var user = chatUsername(), name = '';
+    var links = document.querySelectorAll('a[href]');
+    for (var i = 0; i < links.length; i++) {
+      var r = links[i].getBoundingClientRect();
+      if (!r.width || r.top > 140) continue;
+      var t = (links[i].innerText || '').split('\n').map(function (x) { return x.trim(); }).filter(Boolean);
+      if (t.length && t[0] !== user) { name = t[0]; break; }
+    }
+    var key = location.pathname + '|' + name + '|' + user;
+    if (key === lastChatKey || (!name && !user)) return;
+    lastChatKey = key;
+    try { window.DmeeAndroid.chatOpened(name, user); } catch (err) {}
+  }
+
+  // ===== Stories: swipe down to close (like Instagram's app) =====
+  var storyDrag = null;
+  function storyCloseButton() {
+    var svgs = document.querySelectorAll('svg[aria-label="Close"], svg[aria-label="Zapri"], svg[aria-label="Schließen"], svg[aria-label="Cerrar"], svg[aria-label="Fermer"], svg[aria-label="Zatvori"], svg[aria-label="Chiudi"], svg[aria-label="Zamknij"]');
+    for (var i = 0; i < svgs.length; i++) {
+      var r = svgs[i].getBoundingClientRect();
+      if (r.width && r.top < 200) return svgs[i].closest('button, [role="button"]') || svgs[i].parentElement;
+    }
+    return null;
+  }
+  window.addEventListener('touchstart', function (e) {
+    storyDrag = null;
+    if (!onStories() || e.touches.length !== 1) return;
+    storyDrag = { x: e.touches[0].clientX, y: e.touches[0].clientY, on: false };
+  }, { capture: true, passive: true });
+  window.addEventListener('touchmove', function (e) {
+    if (!storyDrag || !onStories() || !e.touches.length) return;
+    var dx = e.touches[0].clientX - storyDrag.x, dy = e.touches[0].clientY - storyDrag.y;
+    if (!storyDrag.on) {
+      if (dy > 14 && dy > Math.abs(dx) * 1.5) storyDrag.on = true; else return;
+    }
+    // The story follows your finger down a bit and fades.
+    var b = document.body;
+    if (b) { b.style.transition = 'none'; b.style.transform = 'translateY(' + Math.max(0, dy * 0.6) + 'px) scale(' + Math.max(0.85, 1 - dy / 2500) + ')'; b.style.opacity = String(Math.max(0.4, 1 - dy / 900)); }
+  }, { capture: true, passive: true });
+  function storyDragEnd(e) {
+    if (!storyDrag) return;
+    var d = storyDrag; storyDrag = null;
+    if (!d.on) return;
+    var t = (e.changedTouches && e.changedTouches[0]) || null;
+    var dy = t ? t.clientY - d.y : 0;
+    var b = document.body;
+    if (b) {
+      b.style.transition = dy > 140 ? 'none' : 'transform .2s, opacity .2s';
+      b.style.transform = ''; b.style.opacity = '';
+      setTimeout(function () { if (!storyDrag && b.style.transition) b.style.transition = ''; }, 260);
+    }
+    if (dy > 140) {
+      var btn = storyCloseButton();
+      if (btn) btn.click(); else history.back();
+    }
+  }
+  window.addEventListener('touchend', storyDragEnd, { capture: true, passive: true });
+  window.addEventListener('touchcancel', storyDragEnd, { capture: true, passive: true });
+
+  // ===== Story still loading: Instagram's gray box with a big Play icon -> a clean black screen =====
+  var PLAY_LABEL_RE = /^(play|play button|predvajaj|abspielen|reproducir|lire|reproduciraj|riproduci|odtwórz|odtwarzaj)$/i;
+  var playLogFor = '';
+  function storyPlayIcon() {
+    // A story video is playing: nothing to cover.
+    var vids = document.querySelectorAll('video');
+    for (var k = 0; k < vids.length; k++) {
+      var vr = vids[k].getBoundingClientRect();
+      if (vr.width > window.innerWidth * 0.5 && !vids[k].paused && vids[k].currentTime > 0) return null;
+    }
+    // By name (any element, any language) or simply a huge drawing (svg) in the story: Instagram's
+    // stories never show a real svg that big, only this Play icon.
+    var all = document.querySelectorAll('svg, [aria-label]');
+    for (var i = 0; i < all.length; i++) {
+      var el = all[i];
+      if (el.id && el.id.indexOf('dmee') === 0) continue;
+      var lab = (el.getAttribute('aria-label') || '').trim();
+      var isSvg = el.tagName.toLowerCase() === 'svg';
+      if (!PLAY_LABEL_RE.test(lab) && !isSvg) continue;
+      var r = el.getBoundingClientRect();
+      if (r.bottom <= 0 || r.top >= window.innerHeight) continue;
+      if (PLAY_LABEL_RE.test(lab) && r.width > window.innerWidth * 0.25) return el;
+      if (isSvg && r.width > window.innerWidth * 0.4 && r.height > window.innerWidth * 0.4) return el;
+    }
+    // No icon found: a story video that hasn't started yet (Instagram shows its gray box then).
+    for (var m = 0; m < vids.length; m++) {
+      var mr = vids[m].getBoundingClientRect();
+      if (mr.width > window.innerWidth * 0.5 && mr.bottom > 0 && mr.top < window.innerHeight &&
+          vids[m].currentTime === 0 && (vids[m].paused || vids[m].readyState < 3)) return vids[m];
+    }
+    // Debug: what big things are on screen while a story isn't playing (once per story).
+    if (playLogFor !== location.pathname) {
+      var v = document.querySelector('video');
+      if (!v || v.paused) {
+        playLogFor = location.pathname;
+        var big = [];
+        var els = document.querySelectorAll('body *');
+        for (var j = 0; j < els.length && big.length < 8; j++) {
+          var rr = els[j].getBoundingClientRect();
+          if (rr.width > window.innerWidth * 0.5 && rr.width < window.innerWidth * 0.95 && rr.height > 100 && rr.height < window.innerHeight * 0.6)
+            big.push(els[j].tagName + '[' + (els[j].getAttribute('aria-label') || '') + ']' + Math.round(rr.width));
+        }
+        dmeeLog('story not playing, big: ' + big.join(' '));
+      }
+    }
+    return null;
+  }
+  var storyCoverSince = 0;
+  function updateStoryCover() {
+    var c = document.getElementById('dmee-story-cover');
+    var icon = (!window.__dmeeHidden && onStories()) ? storyPlayIcon() : null;
+    if (!icon) { if (c) c.style.display = 'none'; storyCoverSince = 0; return; }
+    // The story's box: the first parent that fills most of the screen.
+    var box = icon, r = icon.getBoundingClientRect();
+    for (var el = icon.parentElement, d = 0; el && el !== document.body && d < 12; el = el.parentElement, d++) {
+      var rr = el.getBoundingClientRect();
+      if (rr.width >= window.innerWidth * 0.8 && rr.height >= window.innerHeight * 0.5) { box = el; r = rr; break; }
+    }
+    if (!c) {
+      c = document.createElement('div');
+      c.id = 'dmee-story-cover';
+      c.style.cssText = 'position:fixed;z-index:2147481500;background:#000;pointer-events:none;display:none;' +
+        'flex-direction:column;align-items:center;justify-content:center;gap:16px;color:rgba(255,255,255,.8);' +
+        'font:500 15px -apple-system,system-ui,Roboto,sans-serif';
+      c.innerHTML = '<div style="width:34px;height:34px;border-radius:50%;border:3px solid rgba(255,255,255,.18);' +
+        'border-top-color:#fff;animation:dmeeSpin .8s linear infinite"></div><div class="t" style="opacity:0;transition:opacity .3s"></div>';
+      var st = document.createElement('style');
+      st.textContent = '@keyframes dmeeSpin{to{transform:rotate(360deg)}}';
+      (document.head || document.documentElement).appendChild(st);
+      (document.body || document.documentElement).appendChild(c);
+    }
+    if (!storyCoverSince) storyCoverSince = Date.now();
+    c.style.left = Math.round(r.left) + 'px'; c.style.top = Math.round(r.top) + 'px';
+    c.style.width = Math.round(r.width) + 'px'; c.style.height = Math.round(r.height) + 'px';
+    c.style.display = 'flex';
+    // Still not playing after a moment: it may need a tap (taps go through to Instagram).
+    var t = c.querySelector('.t');
+    t.textContent = feedText('tap_play', 'Tap to play');
+    t.style.opacity = Date.now() - storyCoverSince > 2500 ? '1' : '0';
+  }
+
+  // ===== View-once photos / videos: Instagram's website can't show them -> open them in Instagram =====
+  // Instagram's own sentence ("…can only be replayed once. Use the mobile app to view."), in each language.
+  var ONCE_RE = /(only be (re)?played once|use the mobile app to view|mobilno aplikacijo|mobile app|aplicación móvil|application mobile|app mobile|mobilnu aplikaciju|aplikacji mobilnej)/i;
+  // Instagram's website shows opened and new view-once photos the same way, so Dmee remembers
+  // which ones you opened (per chat, counted from the newest message up; new ones shift it).
+  function onceStore() { try { return JSON.parse(localStorage.getItem('dmee-once') || '{}'); } catch (e) { return {}; } }
+  function onceSave(st) { try { localStorage.setItem('dmee-once', JSON.stringify(st)); } catch (e) {} }
+  function onceBubbles() { return Array.prototype.slice.call(document.querySelectorAll('[data-dmee-once]')); }
+  function onceState() {
+    var st = onceStore(), k = location.pathname, all = onceBubbles(), T = all.length;
+    var e = st[k] || { n: T, o: [] };
+    if (T > e.n) { var add = T - e.n; e.o = e.o.map(function (i) { return i + add; }); e.n = T; st[k] = e; onceSave(st); }
+    return { st: st, e: e, all: all };
+  }
+  function paintOnceDone() {
+    var s0 = onceState(), all = s0.all;
+    for (var i = 0; i < all.length; i++) {
+      var fromEnd = all.length - 1 - i, done = s0.e.o.indexOf(fromEnd) >= 0;
+      if (done && !all[i].hasAttribute('data-dmee-once-done')) {
+        all[i].setAttribute('data-dmee-once-done', '1');
+        all[i].setAttribute('data-dmee-once', all[i].getAttribute('data-dmee-once').split('\n')[0] + '\n' + feedText('once_opened', 'Opened'));
+      }
+    }
+  }
+  var onceAt = 0, oncePath = '';
+  function markViewOnce() {
+    if (!onThread() || window.__dmeeHidden) return;
+    if (Date.now() - onceAt < 700 && oncePath === location.pathname) return;
+    onceAt = Date.now(); oncePath = location.pathname;
+    if (document.querySelector('[data-dmee-once]')) paintOnceDone();
+    if (!document.getElementById('dmee-once-css')) {
+      var st = document.createElement('style');
+      st.id = 'dmee-once-css';
+      st.textContent = '[data-dmee-once]{cursor:pointer;width:auto !important;min-width:0 !important;max-width:72vw !important;' +
+        'height:auto !important;min-height:0 !important;padding:0 !important;border-radius:22px !important;background:#262626 !important}' +
+        '[data-dmee-once] > *{display:none !important}' +
+        '[data-dmee-once]::after{content:attr(data-dmee-once);display:block;padding:11px 16px;color:#fff;white-space:pre-line;' +
+        'font:600 15px/1.35 -apple-system,system-ui,Roboto,sans-serif}' +
+        '[data-dmee-once-done]{cursor:default}[data-dmee-once-done]::after{color:#8e8e93}';
+      (document.head || document.documentElement).appendChild(st);
+    }
+    var walker = document.createTreeWalker(document.querySelector('main') || document.body, NodeFilter.SHOW_TEXT);
+    var node;
+    while ((node = walker.nextNode())) {
+      var txt = node.nodeValue || '';
+      if (txt.length < 12 || !ONCE_RE.test(txt) || !/(photo|video|foto|vídeo|vidéo|wideo|zdjęcie)/i.test(txt) || !node.parentElement) continue;
+      // The message bubble: the first parent with its own background.
+      var bub = null;
+      for (var el = node.parentElement, d = 0; el && d < 8; el = el.parentElement, d++) {
+        var bg = window.getComputedStyle(el).backgroundColor;
+        if (bg && bg !== 'transparent' && !/rgba\(0, 0, 0, 0\)/.test(bg)) { bub = el; break; }
+      }
+      if (!bub || bub.hasAttribute('data-dmee-once') || bub.getBoundingClientRect().width > window.innerWidth * 0.9) continue;
+      var isVideo = /video|videopos|vidéo|wideo/i.test(txt);
+      bub.setAttribute('data-dmee-once', '▶  ' + (isVideo ? feedText('once_video', 'Video') : feedText('once_photo', 'Photo')) +
+        '\n' + feedText('once_open', 'Tap to view in Instagram'));
+    }
+  }
+  document.addEventListener('click', function (e) {
+    var b = e.target && e.target.closest && e.target.closest('[data-dmee-once]');
+    if (!b) return;
+    e.preventDefault(); e.stopPropagation();
+    if (b.hasAttribute('data-dmee-once-done')) return; // already opened once
+    var s0 = onceState(), idx = s0.all.indexOf(b);
+    if (idx >= 0) {
+      var fromEnd = s0.all.length - 1 - idx;
+      if (s0.e.o.indexOf(fromEnd) < 0) s0.e.o.push(fromEnd);
+      s0.e.n = s0.all.length; s0.st[location.pathname] = s0.e; onceSave(s0.st);
+      paintOnceDone();
+    }
+    try { window.DmeeAndroid.openChatInApp(chatUsername()); } catch (err) {}
+  }, true);
 
   // ===== Reel open: tell the app (it hides the menu) =====
   var lastReel = null;
@@ -1552,16 +1830,26 @@
 
   function updateCameraButton() {
     var cam = document.getElementById('dmee-cam');
+    // While the page is moved/scaled (story swipe-down), sizes are wrong: wait.
+    if (document.body && document.body.style.transform) return;
     var parts = (onThread() && !window.__dmeeHidden && !reelViewerOpen() && !onStories() &&
       !document.querySelector('[role="dialog"]')) ? composerParts() : null;
     if (!parts) { if (cam) cam.style.display = 'none'; return; }
     // The message bar like the Instagram app: a filled pill, no outline, camera inside on the left.
     // Instagram's emoji button (left of the text) makes way for the camera; the keyboard has emojis.
     if (parts.emoji && !parts.emoji.hasAttribute('data-dmee-noemoji')) parts.emoji.setAttribute('data-dmee-noemoji', '1');
-    if (!parts.row.hasAttribute('data-dmee-campad')) parts.row.setAttribute('data-dmee-campad', '1');
-    if (!parts.pill.hasAttribute('data-dmee-composer')) parts.pill.setAttribute('data-dmee-composer', '1');
-    {
-      // Remove Instagram's own outlines and fills inside the bar (they drew a second pill).
+    // Only one bar gets Dmee's look: after a story Instagram may rebuild the bar, and a second
+    // marked box inside the first doubled the margins (the bar got narrow and odd).
+    [['data-dmee-campad', parts.row], ['data-dmee-composer', parts.pill]].forEach(function (p) {
+      var old = document.querySelectorAll('[' + p[0] + ']');
+      for (var o = 0; o < old.length; o++) if (old[o] !== p[1]) old[o].removeAttribute(p[0]);
+      if (!p[1].hasAttribute(p[0])) p[1].setAttribute(p[0], '1');
+    });
+    // Remove Instagram's own outlines and fills inside the bar (they drew a second pill).
+    // Costly (reads every style), so only when the bar's contents changed.
+    var sig = parts.pill.childElementCount + ':' + parts.pill.querySelectorAll('*').length;
+    if (parts.pill.__dmeeClearSig !== sig) {
+      parts.pill.__dmeeClearSig = sig;
       var inner = parts.pill.querySelectorAll('div, span, form');
       for (var q = 0; q < inner.length; q++) {
         var c = inner[q];
@@ -2192,7 +2480,7 @@
         var label = mins < 1 ? feedText('updated_now', 'Updated just now') :
           mins < 60 ? feedText('updated_min', 'Updated %d min ago').replace('%d', mins) :
           feedText('updated_h', 'Updated %d h ago').replace('%d', Math.round(mins / 60));
-        html += '<div style="padding:2px 14px 10px;font-size:12px;color:#8e8e93">' + escapeHtml(label) + '</div>';
+        void label; // not shown any more (too crowded above the posts)
       }
       for (var i = 0; i < items.length; i++) html += postCard(items[i]);
       html += '<div style="padding:28px 20px;text-align:center;color:#8e8e93;font-size:14px">' +
@@ -2335,7 +2623,8 @@
   // ===== Reel: shimmer skeleton until the video really plays =====
   function updateReelSkeleton() {
     var sk = document.getElementById('dmee-reel-sk');
-    var v = (!window.__dmeeHidden && reelViewerOpen()) ? mainReelVideo() : null;
+    var storyLike = /\/stories\//.test(location.pathname) || !snapContainersWithVideo().length;
+    var v = (!window.__dmeeHidden && reelViewerOpen() && !storyLike) ? mainReelVideo() : null;
     var waiting = v && !v.__dmeePlayed && !(v.readyState >= 3 && v.currentTime > 0.05);
     if (v && !v.__dmeeSkWatch) {
       v.__dmeeSkWatch = true;
@@ -2415,37 +2704,60 @@
     pauseAllMedia();
   }
 
+  // Speed check: how long each part of a pass takes (Logcat "DmeeWeb", line "speed:").
+  var perf = {}, perfRuns = 0, perfTotal = 0, perfSince = Date.now();
+  function tm(name, fn) {
+    var t0 = performance.now();
+    try { fn(); } catch (err) {}
+    var d = performance.now() - t0;
+    perf[name] = (perf[name] || 0) + d;
+    perfTotal += d;
+  }
+  function perfReport() {
+    perfRuns++;
+    if (Date.now() - perfSince < 15000) return;
+    var top = Object.keys(perf).sort(function (a, b) { return perf[b] - perf[a]; }).slice(0, 6)
+      .map(function (k) { return k + '=' + Math.round(perf[k]); });
+    if (perfTotal > 50) dmeeLog('speed: ' + perfRuns + ' passes, ' + Math.round(perfTotal) + ' ms in 15 s, ' +
+      location.pathname.replace(/\/t\/[^/]+/, '/t/x') + ' | ' + top.join(' '));
+    perf = {}; perfRuns = 0; perfTotal = 0; perfSince = Date.now();
+  }
   function run() {
-    addStyle();
+    perfReport();
+    tm('addStyle', addStyle);
     // Tabs in the background only do the minimum (keeps older phones fast).
     if (window.__dmeeHidden) { runHidden(); return; }
-    hideInstagramNavBar();
-    hideInboxBackArrow();
-    removeSuggestedReels();
-    fillReelWidth();
-    reportUsername();
-    hideProfileExtras();
-    hideAppPromos();
-    hideStoryPlaceholder();
-    isolateStories();
-    hideDiscoverOnActivity();
-    redDots();
-    padForTabBar();
-    addFeedbackStyle();
-    unmuteReel();
-    update2xButton();
-    updateReelBar();
-    reportSearching();
-    reportReel();
-    fixSqueezedNames();
-    hideTopNotices();
-    reportCornerClose();
-    updateCameraButton();
-    updateFeed();
-    playFeedVideos();
-    updateAddButton();
-    updateReelSkeleton();
-    updateVanishBanner();
+    tm('hideInstagramNavBar', hideInstagramNavBar);
+    tm('hideInboxBackArrow', hideInboxBackArrow);
+    tm('removeSuggestedReels', removeSuggestedReels);
+    tm('fillReelWidth', fillReelWidth);
+    tm('reportUsername', reportUsername);
+    tm('hideProfileExtras', hideProfileExtras);
+    tm('hideAppPromos', hideAppPromos);
+    tm('hideStoryPlaceholder', hideStoryPlaceholder);
+    tm('isolateStories', isolateStories);
+    tm('hideDiscoverOnActivity', hideDiscoverOnActivity);
+    tm('redDots', redDots);
+    tm('padForTabBar', padForTabBar);
+    tm('addFeedbackStyle', addFeedbackStyle);
+    tm('unmuteReel', unmuteReel);
+    tm('update2xButton', update2xButton);
+    tm('updateReelBar', updateReelBar);
+    tm('reportInboxReady', reportInboxReady);
+    tm('reportOpenChat', reportOpenChat);
+    tm('updateStoryCover', updateStoryCover);
+    tm('markViewOnce', markViewOnce);
+    tm('reportSearching', reportSearching);
+    tm('reportReel', reportReel);
+    tm('fixSqueezedNames', fixSqueezedNames);
+    tm('hideTopNotices', hideTopNotices);
+    tm('reportCornerClose', reportCornerClose);
+    tm('updateCameraButton', updateCameraButton);
+    tm('updateFeed', updateFeed);
+    tm('playFeedVideos', playFeedVideos);
+    tm('updateAddButton', updateAddButton);
+    tm('updateReelSkeleton', updateReelSkeleton);
+    tm('updateVanishBanner', updateVanishBanner);
   }
 
   // Instagram changes the page constantly (videos, lazy images). Running on every change made
@@ -2471,6 +2783,12 @@
     new MutationObserver(schedule).observe(document.documentElement, { childList: true, subtree: true });
   }
   startObserving();
+  // Stories: cover Instagram's gray "Play" box within a frame (the normal pass is too slow).
+  var storyFast = 0;
+  new MutationObserver(function () {
+    if (!onStories() || storyFast) return;
+    storyFast = requestAnimationFrame(function () { storyFast = 0; hideStoryPlaceholder(); updateStoryCover(); });
+  }).observe(document.documentElement, { childList: true, subtree: true, attributes: true, attributeFilter: ['src', 'aria-label'] });
   // Instagram changes pages without reloading: re-check right away on every page change.
   ['pushState', 'replaceState'].forEach(function (fn) {
     var orig = history[fn];
@@ -2498,6 +2816,10 @@
     unmuteReel();
     update2xButton();
     updateReelBar();
+    reportInboxReady();
+    reportOpenChat();
+    updateStoryCover();
+    markViewOnce();
     reportReel();
     fixSqueezedNames();
     hideStoryPlaceholder();
