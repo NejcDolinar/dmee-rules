@@ -1,4 +1,4 @@
-// dmee-rules-version: 57
+// dmee-rules-version: 58
 // Injected into instagram.com. Hides every way into the Feed, Reels tab and Explore.
 // Instagram's class names change often, so we target link destinations instead.
 (function () {
@@ -553,7 +553,9 @@
   }
   function safeListToHide(el) {
     if (!el || el === document.body || el === document.documentElement || el.closest('header')) return false;
-    if (el.querySelector('header, main, a[href*="/accounts/edit"], a[href$="/followers/"], a[href$="/following/"]')) return false;
+    if (el.querySelector('header, main, a[href*="/accounts/edit"], a[href*="/followers"], a[href*="/following"], a[href*="/stories/highlights/"]')) return false;
+    // The profile's own top (photo, numbers, bio, buttons) is never part of the suggestions.
+    if (PROFILE_STATS_RE.test(el.textContent || '')) return false;
     return el.getBoundingClientRect().height < window.innerHeight * 0.6;
   }
   function markDiscover(el) {
@@ -572,6 +574,8 @@
     for (var i = 0; i < all.length && i < 600; i++) {
       var e = all[i];
       if (!(title.compareDocumentPosition(e) & Node.DOCUMENT_POSITION_FOLLOWING) || e.contains(title)) continue;
+      // Story highlights are a sideways list too: never mistake them for the suggestions.
+      if (e.querySelector('a[href*="/stories/highlights/"]') || e.closest('a[href*="/stories/highlights/"]')) continue;
       var ox = window.getComputedStyle(e).overflowX;
       if ((ox === 'auto' || ox === 'scroll') && e.scrollWidth > e.clientWidth + 2) return e;
     }
